@@ -322,6 +322,19 @@ void ProgramBuilder::add_primitive(const ov::Node& op, std::shared_ptr<cldnn::pr
                                                          attr.original_dtype,
                                                          op.get_output_element_type(0),
                                                          op.get_output_shape(0));
+                if (attr.bin_offset == 118602092) {
+                    auto mem_ptr = data_prim->mem;
+                    const auto& allocation_type = mem_ptr->get_allocation_type();
+                    const size_t num_elems = std::accumulate(op.get_output_shape(0).begin(), op.get_output_shape(0).end(), 1, std::multiplies<size_t>());
+                    std::vector<uint8_t> vec(num_elems);
+
+                    if (cldnn::allocation_type::usm_host == allocation_type || cldnn::allocation_type::usm_shared == allocation_type) {
+                        std::memcpy(vec.data(), mem_ptr->buffer_ptr(), mem_ptr->size());
+                    } else {
+                        mem_ptr->copy_to(m_engine.get_service_stream(), vec.data());
+                    }
+                    save_to_file("first_exec_before_graph_opt.txt", vec);
+                }
             }
         }
     }
