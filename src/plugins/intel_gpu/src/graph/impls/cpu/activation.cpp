@@ -7,6 +7,9 @@
 #include "register.hpp"
 #include "activation_inst.h"
 #include "registry/implementation_map.hpp"
+#include <iostream>
+#include <iomanip>
+#include <string>
 
 #include "openvino/op/power.hpp"
 #include "openvino/op/tanh.hpp"
@@ -96,6 +99,8 @@ struct activation_impl : public typed_primitive_impl<activation> {
                                    const activation_additional_params& additional_params) {
         auto& stream = instance.get_network().get_stream();
 
+        // std::cout << "*** Execute activation" << " ***" << std::endl;
+
         ov::TensorVector input_host_tensors;
         ov::TensorVector output_host_tensors;
 
@@ -132,6 +137,38 @@ struct activation_impl : public typed_primitive_impl<activation> {
 
         OPENVINO_ASSERT(op->evaluate(output_host_tensors, input_host_tensors),
                         "[GPU] Couldn't execute activation primitive with id ", instance.id());
+
+        // // 检查特定层名称并输出调试信息
+        // std::string layer_name = instance.id();
+        // if (layer_name == "relu:__module.update_block.motion_encoder.convflow1.1/aten::relu_/Relu") {
+        //     std::cout << "=== Debug output for layer: " << layer_name << " ===" << std::endl;
+        //     std::cout << "Input size: " << input_host_tensors[0].get_size() << std::endl;
+        //     std::cout << "Output size: " << output_host_tensors[0].get_size() << std::endl;
+
+        //     // 确保索引在有效范围内
+        //     if (input_host_tensors[0].get_size() > 7555 && output_host_tensors[0].get_size() > 7555) {
+        //         std::cout << "Input[7555]:  " << std::fixed << std::setprecision(8) << input_host_tensors[0].data<float>()[7555] << std::endl;
+        //         std::cout << "Output[7555]: " << std::fixed << std::setprecision(8) << output_host_tensors[0].data<float>()[7555] << std::endl;
+
+        //         // 输出相邻的几个值用于比较
+        //         std::cout << "Input[7554]:  " << input_host_tensors[0].data<float>()[7554] << std::endl;
+        //         std::cout << "Input[7556]:  " << input_host_tensors[0].data<float>()[7556] << std::endl;
+        //         std::cout << "Input[7798]:  " << input_host_tensors[0].data<float>()[7798] << std::endl;
+        //         std::cout << "Input[7799]:  " << input_host_tensors[0].data<float>()[7799] << std::endl;
+        //         std::cout << "Input[7800]:  " << input_host_tensors[0].data<float>()[7800] << std::endl;
+        //         std::cout << "Input[7801]:  " << input_host_tensors[0].data<float>()[7801] << std::endl;
+
+        //         std::cout << "Output[7554]: " << output_host_tensors[0].data<float>()[7554] << std::endl;
+        //         std::cout << "Output[7556]: " << output_host_tensors[0].data<float>()[7556] << std::endl;
+        //         std::cout << "Output[7798]: " << output_host_tensors[0].data<float>()[7798] << std::endl;
+        //         std::cout << "Output[7799]: " << output_host_tensors[0].data<float>()[7799] << std::endl;
+        //         std::cout << "Output[7800]: " << output_host_tensors[0].data<float>()[7800] << std::endl;
+        //         std::cout << "Output[7801]: " << output_host_tensors[0].data<float>()[7801] << std::endl;
+        //     } else {
+        //         std::cout << "Warning: Index 7555 is out of bounds!" << std::endl;
+        //     }
+        //     std::cout << "=== End debug output ===" << std::endl;
+        // }
 
         for (size_t i = 0; i < input_mem_ptrs.size(); i++)
             input_mem_ptrs[i]->unlock(stream);
@@ -272,6 +309,34 @@ struct activation_impl : public typed_primitive_impl<activation> {
         default:
             OPENVINO_THROW("[GPU] Couldn't execute activation operation: unsupported input data type: ",
                            params->input_layouts[0].data_type);
+        }
+
+        // 在函数执行完成后输出特定层的结果数据
+        std::string layer_name = instance.id();
+        if (layer_name == "relu:__module.update_block.motion_encoder.convflow1.1/aten::relu_/Relu") {
+            std::cout << "=== Post-execution output for layer: " << layer_name << " ===" << std::endl;
+            auto output_mem = instance.output_memory_ptr();
+            auto output_layout = instance.get_output_layout();
+
+            if (output_layout.data_type == data_types::f32) {
+                cldnn::mem_lock<float, mem_lock_type::read> output_lock(output_mem, stream);
+                auto output_data = output_lock.data();
+                auto output_size = output_mem->count();
+
+                std::cout << "Output memory size: " << output_size << std::endl;
+                if (output_size > 7801) {
+                    std::cout << "Output[7554]: " << std::fixed << std::setprecision(8) << output_data[7554] << std::endl;
+                    std::cout << "Output[7555]: " << std::fixed << std::setprecision(8) << output_data[7555] << std::endl;
+                    std::cout << "Output[7556]: " << std::fixed << std::setprecision(8) << output_data[7556] << std::endl;
+                    std::cout << "Output[7798]: " << std::fixed << std::setprecision(8) << output_data[7798] << std::endl;
+                    std::cout << "Output[7799]: " << std::fixed << std::setprecision(8) << output_data[7799] << std::endl;
+                    std::cout << "Output[7800]: " << std::fixed << std::setprecision(8) << output_data[7800] << std::endl;
+                    std::cout << "Output[7801]: " << std::fixed << std::setprecision(8) << output_data[7801] << std::endl;
+                } else {
+                    std::cout << "Warning: Output size insufficient for index 7801" << std::endl;
+                }
+            }
+            std::cout << "=== End post-execution output ===" << std::endl;
         }
 
         if (pass_through_events) {

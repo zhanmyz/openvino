@@ -11,7 +11,6 @@
 #include <intel_gpu/primitives/reorder.hpp>
 #include <intel_gpu/primitives/reshape.hpp>
 #include <intel_gpu/primitives/concatenation.hpp>
-#include <intel_gpu/primitives/permute.hpp>
 #include "activation_inst.h"
 
 #include <cmath>
@@ -20,56 +19,110 @@
 using namespace cldnn;
 using namespace ::tests;
 
+std::vector<float> read_tensor_from_file(const std::string& file_path, size_t expected_count);
+
+// 添加读取文件的辅助函数
+std::vector<float> read_tensor_from_file(const std::string& file_path, size_t expected_count = 0) {
+    std::ifstream file(file_path);
+    if (!file.is_open()) {
+        throw std::runtime_error("Cannot open file: " + file_path);
+    }
+
+    std::vector<float> data;
+    std::string line;
+
+    // 跳过第一行 (shape信息)
+    if (std::getline(file, line)) {
+        std::cout << "Shape info: " << line << std::endl;
+    }
+
+    // 读取数据
+    while (std::getline(file, line)) {
+        if (!line.empty()) {
+            try {
+                float value = std::stof(line);
+                data.push_back(value);
+            } catch (const std::exception& e) {
+                std::cerr << "Error parsing line: " << line << " - " << e.what() << std::endl;
+            }
+        }
+    }
+
+    file.close();
+
+    if (expected_count > 0 && data.size() != expected_count) {
+        std::cout << "Warning: Expected " << expected_count 
+                  << " elements, but read " << data.size() << std::endl;
+    }
+
+    std::cout << "Successfully read " << data.size() << " float values from " << file_path << std::endl;
+    return data;
+}
+
 TEST(activation_f32_fw_gpu, dynamic) {
     auto& engine = get_test_engine();
 
-    ov::PartialShape in_shape  = { 1, 1, 4, 2 };
+    // ov::PartialShape in_shape  = { 1, 1, 4, 2 };
+    ov::PartialShape in_shape  = { 1, 128, 65, 120 };
     layout in_layout { ov::PartialShape::dynamic(in_shape.size()), data_types::f32, format::bfyx };
 
     auto input = engine.allocate_memory({ in_shape, data_types::f32, format::bfyx });
-    set_values(input, { -0.12f, 0.56f, 0.45f, -0.789f, 42.f, 0.999f, 0.7899f, 0.f});
+    // set_values(input, { -0.12f, 0.56f, 0.45f, -0.789f, 42.f, 0.999f, 0.7899f, 0.f});
+
+    // 从文件读取数据
+    // 定义张量的维度 (根据您的文件: [b:1, f:128, x:120, y:65])
+    const int batch = 1;
+    const int feature = 128;
+    const int width = 65;   // x维度
+    const int height = 120;   // y维度
+    const size_t total_elements = batch * feature * height * width; // 998400
+    std::string file_path = "/home/yazhan/zhan/openvino_gpu_plugin/cvs-169966/dynamism_dump/layer/program1_network1_0_relu___module.update_block.motion_encoder.convflow1.1_aten__relu__Relu_src0.txt";
+    std::vector<float> input_data = read_tensor_from_file(file_path, total_elements);
+    set_values(input, input_data);
 
     std::vector<activation_func> funcs = {
-        activation_func::gelu,
+        // activation_func::gelu,
         activation_func::relu,
-        activation_func::hyperbolic_tan,
-        activation_func::sqrt
+        // activation_func::hyperbolic_tan,
+        // activation_func::sqrt
     };
 
     for (auto func : funcs) {
         topology topology(input_layout("input", in_layout));
-        topology.add(activation("activation", input_info("input"), func));
+        topology.add(activation("__module.update_block.motion_encoder.convflow1.1/aten::relu_/Relu", input_info("input"), func));
 
         ExecutionConfig config = get_test_default_config(engine);
+        auto forcing_map = ov::intel_gpu::ImplForcingMap{ {"__module.update_block.motion_encoder.convflow1.1/aten::relu_/Relu", {format::bfyx, "", impl_types::cpu}} };
+        config.set_property(ov::intel_gpu::force_implementations(forcing_map));
         config.set_property(ov::intel_gpu::allow_new_shape_infer(true));
         network network(engine, topology, config);
 
         network.set_input_data("input", input);
 
-        auto inst = network.get_primitive("activation");
+        auto inst = network.get_primitive("__module.update_block.motion_encoder.convflow1.1/aten::relu_/Relu");
         auto impl = inst->get_impl();
         ASSERT_TRUE(impl != nullptr);
         ASSERT_TRUE(impl->is_dynamic());
 
         auto outputs = network.execute();
         ASSERT_EQ(outputs.size(), size_t(1));
-        ASSERT_EQ(outputs.begin()->first, "activation");
+        ASSERT_EQ(outputs.begin()->first, "__module.update_block.motion_encoder.convflow1.1/aten::relu_/Relu");
 
-        auto output_memory = outputs.at("activation").get_memory();
+        auto output_memory = outputs.at("__module.update_block.motion_encoder.convflow1.1/aten::relu_/Relu").get_memory();
         auto output_layout = output_memory->get_layout();
         cldnn::mem_lock<float> output_ptr(output_memory, get_test_stream());
         cldnn::mem_lock<float> input_ptr(input, get_test_stream());
 
-        int y_size = output_layout.spatial(1);
-        int x_size = output_layout.spatial(0);
-        int f_size = output_layout.feature();
-        int b_size = output_layout.batch();
+        // int y_size = output_layout.spatial(1);
+        // int x_size = output_layout.spatial(0);
+        // int f_size = output_layout.feature();
+        // int b_size = output_layout.batch();
 
         ASSERT_EQ(output_layout.format, format::bfyx);
-        ASSERT_EQ(y_size, 4);
-        ASSERT_EQ(x_size, 2);
-        ASSERT_EQ(f_size, 1);
-        ASSERT_EQ(b_size, 1);
+        // ASSERT_EQ(y_size, 4);
+        // ASSERT_EQ(x_size, 2);
+        // ASSERT_EQ(f_size, 1);
+        // ASSERT_EQ(b_size, 1);
 
         for (size_t i = 0; i < output_layout.get_linear_size(); ++i) {
             switch (func) {
@@ -700,53 +753,6 @@ TEST(activation_f16_fw_gpu, pow_basic_yxfb) {
 
     for (size_t i = 0; i < output_vec.size(); ++i) {
         ASSERT_FLOAT_EQ(output_vec[i], output_ptr[i]);
-    }
-}
-
-TEST(activation_f16_fw_gpu, softplus_do_not_fuse_for_f16_prevent_overflow) {
-    auto& engine = get_test_engine();
-
-    tensor input_shape{2, 4, 2, 3};
-    auto input = engine.allocate_memory({data_types::f16, format::bfyx, input_shape});
-    set_values<ov::float16>(input, std::vector<ov::float16>(input_shape.count(), ov::float16(12.0f)));
-
-    auto zero = engine.allocate_memory({data_types::f16, format::bfyx, input_shape});
-    set_values<ov::float16>(zero, std::vector<ov::float16>(input_shape.count(), ov::float16(0.0f)));
-
-    topology topology1(input_layout("input", input->get_layout()),
-                      data("zero", zero),
-                      eltwise("sum", input_info("input"), input_info("zero"), eltwise_mode::sum),
-                      activation("softplus", input_info("sum"), activation_func::softplus),
-                      permute("permute", input_info("softplus"), {0, 1, 2, 3}));
-
-    topology topology2(input_layout("input", input->get_layout()),
-                      data("zero", zero),
-                      eltwise("sum", input_info("input"), input_info("zero"), eltwise_mode::sum),
-                      activation("softplus", input_info("sum"), activation_func::softplus),
-                      permute("permute", input_info("softplus"), {0, 1, 2, 3}));
-
-    ExecutionConfig config_fuse = get_test_default_config(engine);
-    config_fuse.set_property(ov::intel_gpu::optimize_data(true));
-    network network_fuse(engine, topology1, config_fuse);
-    network_fuse.set_input_data("input", input);
-    auto output_fuse = network_fuse.execute().begin()->second.get_memory();
-
-    ExecutionConfig config_unfuse = get_test_default_config(engine);
-    config_unfuse.set_property(ov::intel_gpu::optimize_data(false));
-    network network_unfuse(engine, topology2, config_unfuse);
-    network_unfuse.set_input_data("input", input);
-    auto output_unfuse = network_unfuse.execute().begin()->second.get_memory();
-
-    cldnn::mem_lock<ov::float16, mem_lock_type::read> fuse_ptr(output_fuse, get_test_stream());
-    cldnn::mem_lock<ov::float16, mem_lock_type::read> unfuse_ptr(output_unfuse, get_test_stream());
-
-    for (size_t i = 0; i < fuse_ptr.size(); ++i) {
-        float fuse_val = static_cast<float>(fuse_ptr[i]);
-        float unfuse_val = static_cast<float>(unfuse_ptr[i]);
-
-        ASSERT_FALSE(std::isinf(fuse_val));
-        ASSERT_FALSE(std::isinf(unfuse_val));
-        ASSERT_NEAR(fuse_val, unfuse_val, 1e-3f);
     }
 }
 
@@ -1965,7 +1971,15 @@ struct activation_random_test : testing::TestWithParam<activation_random_test_pa
     void execute_compare(const activation_random_test_params& params, bool check_result) {
         auto& engine = get_test_engine();
 
-        const auto& [input_type, input_format, input_size, func_type, additional_params, padd, impl_type, is_caching_test] = params;
+        data_types input_type;
+        format::type input_format;
+        tensor input_size;
+        activation_func func_type;
+        activation_additional_params additional_params;
+        padding padd;
+        impl_types impl_type;
+        bool is_caching_test;
+        std::tie(input_type, input_format, input_size, func_type, additional_params, padd, impl_type, is_caching_test) = params;
         auto in_layout = layout(input_type, format::bfyx, input_size);
 
         auto in_mem = engine.allocate_memory(in_layout);

@@ -96,6 +96,9 @@ KernelsData ActivationKernelBase::GetCommonKernelsData(const Params& params) con
         return {};
     }
 
+    // 输出当前 layer 的 name
+    // std::cout << "Layer name: " << params.layerID << std::endl;
+
     KernelData kd = KernelData::Default<activation_params>(params);
     activation_params& newParams = *static_cast<activation_params*>(kd.params.get());
 

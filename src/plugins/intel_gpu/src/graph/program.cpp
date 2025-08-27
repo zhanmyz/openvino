@@ -521,7 +521,39 @@ void program::init_graph() {
     apply_opt_pass<mark_shape_of_subgraphs>();
 }
 
-void program::run_graph_compilation() { apply_opt_pass<compile_graph>(); }
+void program::run_graph_compilation() {
+    // Debug: Check if target ReLU node exists before compile_graph
+    bool target_relu_found = false;
+    std::cout << "=== LISTING ALL NODES BEFORE COMPILE_GRAPH ===" << std::endl;
+    for (auto& node : get_processing_order()) {
+        std::string node_id = node->get_primitive()->id;
+        std::cout << "Node: " << node_id << std::endl;
+        if (node_id == "relu:__module.update_block.motion_encoder.convflow1.1/aten::relu_/Relu" ||
+            node_id == "__module.update_block.motion_encoder.convflow1.1/aten::relu_/Relu") {
+            target_relu_found = true;
+            std::cout << "=== BEFORE COMPILE_GRAPH: Target ReLU node FOUND: " << node_id << " ===" << std::endl;
+        }
+    }
+    if (!target_relu_found) {
+        std::cout << "=== BEFORE COMPILE_GRAPH: Target ReLU node NOT FOUND ===" << std::endl;
+    }
+
+    apply_opt_pass<compile_graph>();
+
+    // Debug: Check if target ReLU node exists after compile_graph
+    target_relu_found = false;
+    for (auto& node : get_processing_order()) {
+        if (node->get_primitive()->id == "relu:__module.update_block.motion_encoder.convflow1.1/aten::relu_/Relu" ||
+            node->get_primitive()->id == "__module.update_block.motion_encoder.convflow1.1/aten::relu_/Relu") {
+            target_relu_found = true;
+            std::cout << "=== AFTER COMPILE_GRAPH: Target ReLU node FOUND: " << node->get_primitive()->id << " ===" << std::endl;
+            break;
+        }
+    }
+    if (!target_relu_found) {
+        std::cout << "=== AFTER COMPILE_GRAPH: Target ReLU node NOT FOUND ===" << std::endl;
+    }
+}
 
 void program::pre_optimize_graph(bool is_internal) {
     OV_ITT_SCOPED_TASK(ov::intel_gpu::itt::domains::intel_gpu_plugin, "Program::pre_optimize_graph");
@@ -592,6 +624,29 @@ void program::pre_optimize_graph(bool is_internal) {
 
 void program::post_optimize_graph(bool is_internal) {
     OV_ITT_SCOPED_TASK(ov::intel_gpu::itt::domains::intel_gpu_plugin, "Program::post_optimize_graph");
+
+    // Debug: Check if target ReLU node exists before post_optimize_graph
+    bool target_relu_found = false;
+    for (auto& node : get_processing_order()) {
+        if (node->get_primitive()->id == "relu:__module.update_block.motion_encoder.convflow1.1/aten::relu_/Relu" ||
+            node->get_primitive()->id == "__module.update_block.motion_encoder.convflow1.1/aten::relu_/Relu") {
+            target_relu_found = true;
+            std::cout << "=== BEFORE POST_OPTIMIZE_GRAPH: Target ReLU node FOUND: " << node->get_primitive()->id << " ===" << std::endl;
+            std::cout << "ReLU node users count: " << node->get_users().size() << std::endl;
+            std::cout << "ReLU node dependencies count: " << node->get_dependencies().size() << std::endl;
+            if (!node->get_users().empty()) {
+                std::cout << "ReLU node first user: " << node->get_users().front()->id() << std::endl;
+            }
+            if (!node->get_dependencies().empty()) {
+                std::cout << "ReLU node first dep: " << node->get_dependencies().front().first->id() << std::endl;
+            }
+            break;
+        }
+    }
+    if (!target_relu_found) {
+        std::cout << "=== BEFORE POST_OPTIMIZE_GRAPH: Target ReLU node NOT FOUND ===" << std::endl;
+    }
+
     // input reorder for fully connected if necessary
     apply_opt_pass<post_input_reorder>();
 
@@ -627,6 +682,22 @@ void program::post_optimize_graph(bool is_internal) {
         get_processing_order().calculate_BFS_processing_order();
 
     apply_opt_pass<mark_state_init_subgraphs>();
+
+    // Debug: Check if target ReLU node exists after post_optimize_graph
+    target_relu_found = false;
+    for (auto& node : get_processing_order()) {
+        if (node->get_primitive()->id == "relu:__module.update_block.motion_encoder.convflow1.1/aten::relu_/Relu" ||
+            node->get_primitive()->id == "__module.update_block.motion_encoder.convflow1.1/aten::relu_/Relu") {
+            target_relu_found = true;
+            std::cout << "=== AFTER POST_OPTIMIZE_GRAPH: Target ReLU node FOUND: " << node->get_primitive()->id << " ===" << std::endl;
+            std::cout << "ReLU node users count: " << node->get_users().size() << std::endl;
+            std::cout << "ReLU node dependencies count: " << node->get_dependencies().size() << std::endl;
+            break;
+        }
+    }
+    if (!target_relu_found) {
+        std::cout << "=== AFTER POST_OPTIMIZE_GRAPH: Target ReLU node NOT FOUND ===" << std::endl;
+    }
 }
 
 // mark if the node is constant assuming that all dependencies are marked properly
@@ -687,12 +758,6 @@ void program::transfer_memory_to_device() {
             }
 
             if (alloc_type == allocation_type::usm_host || alloc_type == allocation_type::usm_shared) {
-                // usm_device memory does not provide performance benefits on the LNL platform
-                if (get_engine().get_device_info().arch == gpu_arch::xe2 &&
-                    get_engine().get_device_info().dev_type == device_type::integrated_gpu) {
-                    return;
-                }
-
                 GPU_DEBUG_LOG << "[" << data_node.id() << ": constant]" << std::endl;
                 // Allocate and transfer memory
                 auto device_mem = mem.get_engine()->allocate_memory(data_node_layout, allocation_type::usm_device, false);
@@ -973,6 +1038,18 @@ void program::replace_all_usages(program_node& old_node, program_node& new_node,
 }
 
 void program::replace_all_usages(program_node& old_node, std::pair<program_node*, int32_t> new_node, bool remove_if_dangling) {
+    // Debug: Check if someone is trying to replace our target ReLU node
+    std::string old_node_name = old_node.id();
+    if (old_node_name == "relu:__module.update_block.motion_encoder.convflow1.1/aten::relu_/Relu" ||
+        old_node_name == "__module.update_block.motion_encoder.convflow1.1/aten::relu_/Relu") {
+        std::cout << "=== WARNING: SOMEONE IS TRYING TO REPLACE TARGET ReLU NODE ===" << std::endl;
+        std::cout << "Old node: " << old_node_name << std::endl;
+        std::cout << "New node: " << new_node.first->id() << std::endl;
+        std::cout << "Remove if dangling: " << remove_if_dangling << std::endl;
+        // Prevent replacement of our target ReLU
+        return;
+    }
+
     // We need a copy of users of old_node because old_node may be removed when doing replace_dependency()
     const std::list<program_node*> users(old_node.users);
     auto itr = users.begin();
@@ -983,6 +1060,14 @@ void program::replace_all_usages(program_node& old_node, std::pair<program_node*
 }
 
 void program::replace(program_node& old_node, program_node& new_node) {
+    // PROTECT TARGET RELU FROM REPLACEMENT
+    if (old_node.id().find("relu:__module.update_block.motion_encoder.convflow1.1/aten::relu_/Relu") != std::string::npos ||
+        old_node.id().find("__module.update_block.motion_encoder.convflow1.1/aten::relu_/Relu") != std::string::npos) {
+        GPU_DEBUG_LOG << "[PROTECTION] Blocking replace() of target ReLU node: " << old_node.id() << std::endl;
+        std::cout << "[PROTECTION] Blocking replace() of target ReLU node: " << old_node.id() << std::endl;
+        return;
+    }
+
     if (!new_node.dependencies.empty() || !new_node.users.empty())
         throw std::invalid_argument("Node which is about to replace other node should be detached");
 
@@ -1247,6 +1332,19 @@ void program::fuse_nodes(program_node &fused_node,
 }
 
 void program::remove_nodes(std::vector<program_node*>& to_remove) {
+    // PROTECT TARGET RELU FROM REMOVAL
+    auto it = to_remove.begin();
+    while (it != to_remove.end()) {
+        if ((*it)->id().find("relu:__module.update_block.motion_encoder.convflow1.1/aten::relu_/Relu") != std::string::npos ||
+            (*it)->id().find("__module.update_block.motion_encoder.convflow1.1/aten::relu_/Relu") != std::string::npos) {
+            GPU_DEBUG_LOG << "[PROTECTION] Removing target ReLU from removal list: " << (*it)->id() << std::endl;
+            std::cout << "[PROTECTION] Removing target ReLU from removal list: " << (*it)->id() << std::endl;
+            it = to_remove.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
     for (auto const& node : to_remove) {
         if (node->is_input()) {
             get_inputs().remove(node);

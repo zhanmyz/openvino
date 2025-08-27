@@ -51,6 +51,9 @@ void CreateUnaryEltwiseOp(ProgramBuilder& p, const std::shared_ptr<ov::Node>& op
                           cldnn::activation_func func, cldnn::activation_additional_params params) {
     auto inputs = p.GetInputInfo(op);
     std::string layerName = layer_type_name_ID(op);
+    if (layerName == "relu:__module.update_block.motion_encoder.convflow1.1/aten::relu_/Relu") {
+        std::cout << "***layerName: " << layerName << std::endl;
+    }
     auto activationPrimitive = cldnn::activation(layerName, inputs[0], func, params);
     p.add_primitive(*op, activationPrimitive);
 }

@@ -75,7 +75,49 @@ void dump(memory::ptr mem, stream& stream, std::ofstream& file_stream, bool dump
     auto x_pitch = get_x_pitch(mem->get_layout());
     std::stringstream buffer;
 
+    float value0 = reinterpret_cast<const float*>(mem_ptr)[7552];
+    float value1 = reinterpret_cast<const float*>(mem_ptr)[7553];
+    float value2 = reinterpret_cast<const float*>(mem_ptr)[7799];
+    float value3 = reinterpret_cast<const float*>(mem_ptr)[7800];
+    std::cout << "Runtime Layer " << "第7552位数值: " << value0 << std::endl;
+    std::cout << "Runtime Layer " << "第7553位数值: " << value1 << std::endl;
+    std::cout << "Runtime Layer " << "第7799位数值: " << value2 << std::endl;
+    std::cout << "Runtime Layer " << "第7800位数值: " << value3 << std::endl;
+
     if (!dump_raw) {
+        // 添加调试信息
+        std::cout << "=== 调试信息 ===" << std::endl;
+        std::cout << "Layout: " << mem->get_layout().to_string() << std::endl;
+        std::cout << "x_pitch: " << x_pitch << std::endl;
+
+        // 详细分析padding和内存布局
+        auto& layout = mem->get_layout();
+        auto logical_shape = layout.get_dims();
+        auto padded_shape = layout.get_padded_dims();
+        auto pitches = layout.get_pitches();
+
+        std::cout << "逻辑形状: [";
+        for (size_t i = 0; i < logical_shape.size(); i++) {
+            std::cout << logical_shape[i];
+            if (i < logical_shape.size() - 1) std::cout << ", ";
+        }
+        std::cout << "]" << std::endl;
+
+        std::cout << "物理形状(含padding): [";
+        for (size_t i = 0; i < padded_shape.size(); i++) {
+            std::cout << padded_shape[i];
+            if (i < padded_shape.size() - 1) std::cout << ", ";
+        }
+        std::cout << "]" << std::endl;
+
+        std::cout << "各维度跨度(pitches): [";
+        for (size_t i = 0; i < pitches.size(); i++) {
+            std::cout << pitches[i];
+            if (i < pitches.size() - 1) std::cout << ", ";
+        }
+        std::cout << "]" << std::endl;
+
+        size_t output_index = 0;  // 追踪输出到buffer的行号
         for (ov::Dimension::value_type g = 0; g < size.group[0]; ++g) {
             for (ov::Dimension::value_type b = 0; b < batch_size; ++b) {
                 for (ov::Dimension::value_type f = 0; f < size.feature[0]; ++f) {
@@ -86,7 +128,18 @@ void dump(memory::ptr mem, stream& stream, std::ofstream& file_stream, bool dump
                                 size_t input_it = mem->get_layout().get_linear_offset(t);
 
                                 for (ov::Dimension::value_type x = 0; x < size.spatial[0]; ++x, input_it += x_pitch) {
+                                    // 调试关键索引范围
+                                    if (output_index >= 7552 && output_index <= 7553) {
+                                        std::cout << "输出行" << output_index << ": f=" << f << ", y=" << y << ", x=" << x
+                                                  << ", mem_offset=" << input_it << ", value=" << convert_element(mem_ptr[input_it]) << std::endl;
+                                    }
+                                    if (output_index >= 7798 && output_index <= 7801) {
+                                        std::cout << "输出行" << output_index << ": f=" << f << ", y=" << y << ", x=" << x
+                                                  << ", mem_offset=" << input_it << ", value=" << convert_element(mem_ptr[input_it]) << std::endl;
+                                    }
+
                                     buffer << std::fixed << std::setprecision(6) << convert_element(mem_ptr[input_it]) << std::endl;
+                                    output_index++;
                                 }
                             }
                         }
@@ -94,12 +147,33 @@ void dump(memory::ptr mem, stream& stream, std::ofstream& file_stream, bool dump
                 }
             }
         }
+        std::cout << "总输出行数: " << output_index << std::endl;
+        std::cout << "=== 调试信息结束 ===" << std::endl;
     } else {
         for (size_t i = 0; i < lock.size(); ++i) {
             buffer << std::fixed << std::setprecision(6) << convert_element(mem_ptr[i]) << std::endl;
         }
     }
     file_stream << buffer.str();
+
+    // 输出第7798~7801位的数值
+    std::istringstream iss(buffer.str());
+    std::string line;
+    int idx = 0;
+    float values[4] = {0};
+    while (std::getline(iss, line)) {
+        if (idx >= 7552 && idx <= 7553) {
+            values[idx - 7552] = std::stof(line);
+        }
+        if (idx >= 7799 && idx <= 7800) {
+            values[idx - 7797] = std::stof(line);
+        }
+        ++idx;
+    }
+    std::cout << "file_stream 第7552位数值: " << values[0] << std::endl;
+    std::cout << "file_stream 第7553位数值: " << values[1] << std::endl;
+    std::cout << "file_stream 第7799位数值: " << values[2] << std::endl;
+    std::cout << "file_stream 第7800位数值: " << values[3] << std::endl;
 }
 
 void unpack(cldnn::data_types type, uint8_t input, int8_t &v0, int8_t &v1) {
@@ -464,33 +538,26 @@ NodeDebugHelper::~NodeDebugHelper() {
                                        m_stream,
                                        filename,
                                        dump_raw);
+
+                    // 输出第7799位数值
+                    if (output_mem && output_mem->size() > 7799) {
+                        mem_lock<char, mem_lock_type::read> lock(output_mem, m_stream);
+                        auto data_ptr = lock.data();
+                        // 假设数据类型为float（如需其他类型请修改）
+                        float value1 = reinterpret_cast<const float*>(data_ptr)[7798];
+                        float value2 = reinterpret_cast<const float*>(data_ptr)[7799];
+                        float value3 = reinterpret_cast<const float*>(data_ptr)[7800];
+                        float value4 = reinterpret_cast<const float*>(data_ptr)[7801];
+                        std::cout << "Layer " << layer_name << " output[" << i << "] 第7798位数值: " << value1 << std::endl;
+                        std::cout << "Layer " << layer_name << " output[" << i << "] 第7799位数值: " << value2 << std::endl;
+                        std::cout << "Layer " << layer_name << " output[" << i << "] 第7800位数值: " << value3 << std::endl;
+                        std::cout << "Layer " << layer_name << " output[" << i << "] 第7801位数值: " << value4 << std::endl;
+                    } else {
+                        std::cout << "Layer " << layer_name << " output[" << i << "] 数据不足7799位, 无法输出该数值。" << std::endl;
+                    }
                 }
             }
-            for (size_t i = 0; i < m_inst.get_intermediates_memories().size(); i++) {
-                std::string name = get_file_prefix() + "_intermediates_" + std::to_string(i);
-                auto output_mem = m_inst.get_intermediates_memories()[i];
-                if (output_mem == nullptr) {
-                    GPU_DEBUG_COUT << " intermediates_mem is nullptr. Nothing to dump." << std::endl;
-                    continue;
-                }
 
-                auto& output_layout = output_mem->get_layout();
-                if (config.get_dump_tensors_format() == ov::intel_gpu::DumpFormat::binary) {
-                    // Binary dump : raw
-                    auto filename = get_file_path_for_binary_dump(output_layout, name, config.get_dump_tensors_path());
-
-                    mem_lock<char, mem_lock_type::read> lock(output_mem, m_stream);
-                    ov::util::save_binary(filename, lock.data(), output_mem->size());
-                    GPU_DEBUG_COUT << " Dump layer dst : " << layer_name << " to " << filename << std::endl;
-                    debug_str_for_bin_load += (filename + ",");
-                } else {
-                    const bool dump_raw = config.get_dump_tensors_format() == ov::intel_gpu::DumpFormat::text_raw;
-                    GPU_DEBUG_COUT << " Dump " << (dump_raw ? "raw " : "") << name << std::endl;
-                    auto filename = config.get_dump_tensors_path() + get_name_for_dump(name) + ".txt";
-                    // Text dump
-                    log_memory_to_file(output_mem, output_layout, m_stream, filename, dump_raw);
-                }
-            }
             if (config.get_dump_tensors_format() == ov::intel_gpu::DumpFormat::binary && m_inst.is_input()) {
                 debug_str_for_bin_load[debug_str_for_bin_load.size()-1] = '\"';
                 GPU_DEBUG_COUT << debug_str_for_bin_load << std::endl;;

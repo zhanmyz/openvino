@@ -40,7 +40,22 @@ static bool is_shape_of_subgraph_root(program_node& node) {
 }
 
 void mark_shape_of_subgraphs::look_for_shape_of_subgraph(program_node& node) {
+    std::string node_name = node.id();
+
+    bool is_target_relu = (node_name == "relu:__module.update_block.motion_encoder.convflow1.1/aten::relu_/Relu" ||
+                          node_name == "__module.update_block.motion_encoder.convflow1.1/aten::relu_/Relu");
+
+    if (is_target_relu) {
+        std::cout << "=== mark_shape_of_subgraphs::look_for_shape_of_subgraph ===" << std::endl;
+        std::cout << "Processing node: " << node_name << std::endl;
+        std::cout << "Node type: " << node.get_primitive()->type_string() << std::endl;
+        std::cout << "Is shape_of_subgraph_root: " << is_shape_of_subgraph_root(node) << std::endl;
+    }
+
     if (is_shape_of_subgraph_root(node)) {
+        if (is_target_relu) {
+            std::cout << "Node is shape_of_subgraph_root - marking and returning" << std::endl;
+        }
         mark_node(node);
         return;
     }
@@ -48,13 +63,30 @@ void mark_shape_of_subgraphs::look_for_shape_of_subgraph(program_node& node) {
     // Check if all dependencies are constant or marked as a part of shape_of subgraph
     bool can_execute_in_subgraph = true;
     bool has_shape_of_subgraph_dep = false;
+
+    if (is_target_relu) {
+        std::cout << "Checking dependencies (" << node.get_dependencies().size() << " total):" << std::endl;
+    }
+
     for (auto& dependency : node.get_dependencies()) {
+        if (is_target_relu) {
+            std::cout << "  Dep: " << dependency.first->id()
+                      << ", is_in_shape_of_subgraph: " << dependency.first->is_in_shape_of_subgraph()
+                      << ", is_constant: " << dependency.first->is_constant() << std::endl;
+        }
+
         if (dependency.first->is_in_shape_of_subgraph()) {
             has_shape_of_subgraph_dep = true;
         } else if (!dependency.first->is_constant()) {
             can_execute_in_subgraph = false;
             break;
         }
+    }
+
+    if (is_target_relu) {
+        std::cout << "Analysis results:" << std::endl;
+        std::cout << "  has_shape_of_subgraph_dep: " << has_shape_of_subgraph_dep << std::endl;
+        std::cout << "  can_execute_in_subgraph: " << can_execute_in_subgraph << std::endl;
     }
 
     // Node should have at least one dependency marked as a part of shape_of subgraph
@@ -68,6 +100,14 @@ void mark_shape_of_subgraphs::look_for_shape_of_subgraph(program_node& node) {
 }
 
 bool mark_shape_of_subgraphs::can_mark_node(const program_node& node) {
+    // Force specific ReLU to use GPU implementation instead of CPU
+    std::string node_name = node.id();
+    if (node_name == "relu:__module.update_block.motion_encoder.convflow1.1/aten::relu_/Relu" ||
+        node_name == "__module.update_block.motion_encoder.convflow1.1/aten::relu_/Relu") {
+        std::cout << "=== can_mark_node: FORCING RETURN FALSE for " << node_name << " ===" << std::endl;
+        return false;
+    }
+
     if (node.has_fused_primitives())
         return false;
 
@@ -121,16 +161,32 @@ bool mark_shape_of_subgraphs::can_mark_node(const program_node& node) {
 }
 
 void mark_shape_of_subgraphs::mark_node(program_node& node) {
+    std::string node_name = node.id();
+    bool is_target_relu = (node_name == "relu:__module.update_block.motion_encoder.convflow1.1/aten::relu_/Relu" ||
+                          node_name == "__module.update_block.motion_encoder.convflow1.1/aten::relu_/Relu");
+
+    if (is_target_relu) {
+        std::cout << "=== mark_node for " << node_name << " ===" << std::endl;
+    }
+
     node.set_in_shape_of_subgraph(true);
 
     // If current node has shape_of type add it to dependant shape_of nodes for
     // correct dependency propagation for users
-    if (is_shape_of_subgraph_root(node))
+    if (is_shape_of_subgraph_root(node)) {
+        if (is_target_relu) {
+            std::cout << "Node is shape_of_subgraph_root, adding to dependant_shape_of_nodes" << std::endl;
+        }
         node.add_dependant_shape_of_node(&node);
+    }
 
     // Add parent shape_of nodes from other dependencies if there are any
     for (auto dep : node.get_dependencies()) {
         if (dep.first->is_in_shape_of_subgraph()) {
+            if (is_target_relu) {
+                std::cout << "  Dependency " << dep.first->id() << " is in shape_of_subgraph" << std::endl;
+                std::cout << "  Adding " << dep.first->get_dependant_shape_of_nodes().size() << " dependant shape_of nodes" << std::endl;
+            }
             for (auto shape_of : dep.first->get_dependant_shape_of_nodes()) {
                 node.add_dependant_shape_of_node(shape_of);
             }

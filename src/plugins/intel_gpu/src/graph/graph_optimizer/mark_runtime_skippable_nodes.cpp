@@ -28,6 +28,15 @@ void mark_runtime_skippable_nodes::run(program& p) {
 
     while (itr != p.get_processing_order().end()) {
         auto& node = *itr++;
+
+        // Prevent specific ReLU from being marked as optimizable
+        std::string node_name = node->id();
+        if (node_name == "relu:__module.update_block.motion_encoder.convflow1.1/aten::relu_/Relu" ||
+            node_name == "__module.update_block.motion_encoder.convflow1.1/aten::relu_/Relu") {
+            std::cout << "=== PREVENTING MARK_RUNTIME_SKIPPABLE for " << node_name << " ===" << std::endl;
+            continue;
+        }
+
         // Set gathers that might be skipped at runtime as can_be_optimized.
         // If not set, memory dependency will not work for the nodes that are skipped at runtime
         if (node->is_type<data>() || node->is_constant())
