@@ -76,6 +76,38 @@ void dump(memory::ptr mem, stream& stream, std::ofstream& file_stream, bool dump
     std::stringstream buffer;
 
     if (!dump_raw) {
+        // 添加调试信息
+        std::cout << "=== 调试信息 ===" << std::endl;
+        std::cout << "Layout: " << mem->get_layout().to_string() << std::endl;
+        std::cout << "x_pitch: " << x_pitch << std::endl;
+
+        // 详细分析padding和内存布局
+        auto& layout = mem->get_layout();
+        auto logical_shape = layout.get_dims();
+        auto padded_shape = layout.get_padded_dims();
+        auto pitches = layout.get_pitches();
+
+        std::cout << "逻辑形状: [";
+        for (size_t i = 0; i < logical_shape.size(); i++) {
+            std::cout << logical_shape[i];
+            if (i < logical_shape.size() - 1) std::cout << ", ";
+        }
+        std::cout << "]" << std::endl;
+
+        std::cout << "物理形状(含padding): [";
+        for (size_t i = 0; i < padded_shape.size(); i++) {
+            std::cout << padded_shape[i];
+            if (i < padded_shape.size() - 1) std::cout << ", ";
+        }
+        std::cout << "]" << std::endl;
+
+        std::cout << "各维度跨度(pitches): [";
+        for (size_t i = 0; i < pitches.size(); i++) {
+            std::cout << pitches[i];
+            if (i < pitches.size() - 1) std::cout << ", ";
+        }
+        std::cout << "]" << std::endl;
+
         for (ov::Dimension::value_type g = 0; g < size.group[0]; ++g) {
             for (ov::Dimension::value_type b = 0; b < batch_size; ++b) {
                 for (ov::Dimension::value_type f = 0; f < size.feature[0]; ++f) {
@@ -94,6 +126,8 @@ void dump(memory::ptr mem, stream& stream, std::ofstream& file_stream, bool dump
                 }
             }
         }
+
+        std::cout << "=== 调试信息结束 ===" << std::endl;
     } else {
         for (size_t i = 0; i < lock.size(); ++i) {
             buffer << std::fixed << std::setprecision(6) << convert_element(mem_ptr[i]) << std::endl;

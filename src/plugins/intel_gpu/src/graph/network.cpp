@@ -776,6 +776,24 @@ void network::execute_impl(const std::vector<event::ptr>& events) {
         }
 
         inst->prepare_primitive();
+
+        // Debug: Track convolution node's in_shape_of_subgraph status at execution time
+        std::string node_id = inst->id();
+        if (node_id == "convolution:__module.update_block.motion_encoder.convflow1.0/aten::_convolution/Convolution" ||
+            node_id == "__module.update_block.motion_encoder.convflow1.0/aten::_convolution/Convolution") {
+            std::cout << "=== NETWORK EXECUTE: CONVOLUTION node at execution time ===" << std::endl;
+            std::cout << "Convolution ID: " << node_id << std::endl;
+            std::cout << "Convolution is_in_shape_of_subgraph at execution: " << inst->get_node().is_in_shape_of_subgraph() << std::endl;
+        }
+
+        // Debug: Track ReLU node's in_shape_of_subgraph status at execution time
+        if (node_id == "relu:__module.update_block.motion_encoder.convflow1.1/aten::relu_/Relu" ||
+            node_id == "__module.update_block.motion_encoder.convflow1.1/aten::relu_/Relu") {
+            std::cout << "=== NETWORK EXECUTE: ReLU node at execution time ===" << std::endl;
+            std::cout << "ReLU ID: " << node_id << std::endl;
+            std::cout << "ReLU is_in_shape_of_subgraph at execution: " << inst->get_node().is_in_shape_of_subgraph() << std::endl;
+        }
+
         inst->execute();
 
         executed_prims++;

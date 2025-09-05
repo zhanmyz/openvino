@@ -40,15 +40,28 @@ static bool is_shape_of_subgraph_root(program_node& node) {
 }
 
 void mark_shape_of_subgraphs::look_for_shape_of_subgraph(program_node& node) {
+    std::string node_name = node.id();
+    bool is_prev_convolution = (node_name == "convolution:__module.update_block.motion_encoder.convflow1.0/aten::_convolution/Convolution" ||
+                          node_name == "__module.update_block.motion_encoder.convflow1.0/aten::_convolution/Convolution");
+
     if (is_shape_of_subgraph_root(node)) {
         mark_node(node);
         return;
+    }
+
+    if (is_prev_convolution) {
+        std::cout << "Checking dependencies (" << node.get_dependencies().size() << " total):" << std::endl;
     }
 
     // Check if all dependencies are constant or marked as a part of shape_of subgraph
     bool can_execute_in_subgraph = true;
     bool has_shape_of_subgraph_dep = false;
     for (auto& dependency : node.get_dependencies()) {
+        if (is_prev_convolution) {
+            std::cout << "  Dep: " << dependency.first->id()
+                      << ", is_in_shape_of_subgraph: " << dependency.first->is_in_shape_of_subgraph()
+                      << ", is_constant: " << dependency.first->is_constant() << std::endl;
+        }
         if (dependency.first->is_in_shape_of_subgraph()) {
             has_shape_of_subgraph_dep = true;
         } else if (!dependency.first->is_constant()) {

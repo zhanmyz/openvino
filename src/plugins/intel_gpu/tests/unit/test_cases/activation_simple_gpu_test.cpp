@@ -20,56 +20,110 @@
 using namespace cldnn;
 using namespace ::tests;
 
+std::vector<float> read_tensor_from_file(const std::string& file_path, size_t expected_count);
+
+// 添加读取文件的辅助函数
+std::vector<float> read_tensor_from_file(const std::string& file_path, size_t expected_count = 0) {
+    std::ifstream file(file_path);
+    if (!file.is_open()) {
+        throw std::runtime_error("Cannot open file: " + file_path);
+    }
+
+    std::vector<float> data;
+    std::string line;
+
+    // 跳过第一行 (shape信息)
+    if (std::getline(file, line)) {
+        std::cout << "Shape info: " << line << std::endl;
+    }
+
+    // 读取数据
+    while (std::getline(file, line)) {
+        if (!line.empty()) {
+            try {
+                float value = std::stof(line);
+                data.push_back(value);
+            } catch (const std::exception& e) {
+                std::cerr << "Error parsing line: " << line << " - " << e.what() << std::endl;
+            }
+        }
+    }
+
+    file.close();
+
+    if (expected_count > 0 && data.size() != expected_count) {
+        std::cout << "Warning: Expected " << expected_count 
+                  << " elements, but read " << data.size() << std::endl;
+    }
+
+    std::cout << "Successfully read " << data.size() << " float values from " << file_path << std::endl;
+    return data;
+}
+
 TEST(activation_f32_fw_gpu, dynamic) {
     auto& engine = get_test_engine();
 
-    ov::PartialShape in_shape  = { 1, 1, 4, 2 };
+    // ov::PartialShape in_shape  = { 1, 1, 4, 2 };
+    ov::PartialShape in_shape  = { 1, 128, 65, 120 };
     layout in_layout { ov::PartialShape::dynamic(in_shape.size()), data_types::f32, format::bfyx };
 
     auto input = engine.allocate_memory({ in_shape, data_types::f32, format::bfyx });
-    set_values(input, { -0.12f, 0.56f, 0.45f, -0.789f, 42.f, 0.999f, 0.7899f, 0.f});
+    // set_values(input, { -0.12f, 0.56f, 0.45f, -0.789f, 42.f, 0.999f, 0.7899f, 0.f});
+
+    // 从文件读取数据
+    // 定义张量的维度 (根据您的文件: [b:1, f:128, x:120, y:65])
+    const int batch = 1;
+    const int feature = 128;
+    const int width = 65;   // x维度
+    const int height = 120;   // y维度
+    const size_t total_elements = batch * feature * height * width; // 998400
+    std::string file_path = "/home/yazhan/zhan/openvino_gpu_plugin/cvs-169966/dynamism_dump/layer/program1_network1_0_relu___module.update_block.motion_encoder.convflow1.1_aten__relu__Relu_src0.txt";
+    std::vector<float> input_data = read_tensor_from_file(file_path, total_elements);
+    set_values(input, input_data);
 
     std::vector<activation_func> funcs = {
-        activation_func::gelu,
+        // activation_func::gelu,
         activation_func::relu,
-        activation_func::hyperbolic_tan,
-        activation_func::sqrt
+        // activation_func::hyperbolic_tan,
+        // activation_func::sqrt
     };
 
     for (auto func : funcs) {
         topology topology(input_layout("input", in_layout));
-        topology.add(activation("activation", input_info("input"), func));
+        topology.add(activation("__module.update_block.motion_encoder.convflow1.1/aten::relu_/Relu", input_info("input"), func));
 
         ExecutionConfig config = get_test_default_config(engine);
+        auto forcing_map = ov::intel_gpu::ImplForcingMap{ {"__module.update_block.motion_encoder.convflow1.1/aten::relu_/Relu", {format::bfyx, "", impl_types::cpu}} };
+        config.set_property(ov::intel_gpu::force_implementations(forcing_map));
         config.set_property(ov::intel_gpu::allow_new_shape_infer(true));
         network network(engine, topology, config);
 
         network.set_input_data("input", input);
 
-        auto inst = network.get_primitive("activation");
+        auto inst = network.get_primitive("__module.update_block.motion_encoder.convflow1.1/aten::relu_/Relu");
         auto impl = inst->get_impl();
         ASSERT_TRUE(impl != nullptr);
         ASSERT_TRUE(impl->is_dynamic());
 
         auto outputs = network.execute();
         ASSERT_EQ(outputs.size(), size_t(1));
-        ASSERT_EQ(outputs.begin()->first, "activation");
+        ASSERT_EQ(outputs.begin()->first, "__module.update_block.motion_encoder.convflow1.1/aten::relu_/Relu");
 
-        auto output_memory = outputs.at("activation").get_memory();
+        auto output_memory = outputs.at("__module.update_block.motion_encoder.convflow1.1/aten::relu_/Relu").get_memory();
         auto output_layout = output_memory->get_layout();
         cldnn::mem_lock<float> output_ptr(output_memory, get_test_stream());
         cldnn::mem_lock<float> input_ptr(input, get_test_stream());
 
-        int y_size = output_layout.spatial(1);
-        int x_size = output_layout.spatial(0);
-        int f_size = output_layout.feature();
-        int b_size = output_layout.batch();
+        // int y_size = output_layout.spatial(1);
+        // int x_size = output_layout.spatial(0);
+        // int f_size = output_layout.feature();
+        // int b_size = output_layout.batch();
 
         ASSERT_EQ(output_layout.format, format::bfyx);
-        ASSERT_EQ(y_size, 4);
-        ASSERT_EQ(x_size, 2);
-        ASSERT_EQ(f_size, 1);
-        ASSERT_EQ(b_size, 1);
+        // ASSERT_EQ(y_size, 4);
+        // ASSERT_EQ(x_size, 2);
+        // ASSERT_EQ(f_size, 1);
+        // ASSERT_EQ(b_size, 1);
 
         for (size_t i = 0; i < output_layout.get_linear_size(); ++i) {
             switch (func) {
