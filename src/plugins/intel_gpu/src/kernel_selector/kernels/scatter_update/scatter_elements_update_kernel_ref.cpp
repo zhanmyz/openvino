@@ -101,20 +101,31 @@ CommonDispatchData ScatterElementsUpdateKernelRef::SetDefault(const scatter_elem
             switch (rank) {
                 case 4:
                     dispatchData.gws = {indices.X().v * indices.Y().v, indices.Feature().v, indices.Batch().v};
-                    dispatchData.lws = {1, 1, indices.Batch().v};
+                    dims_by_gws = {{Tensor::DataChannelName::X, Tensor::DataChannelName::Y},
+                                  {Tensor::DataChannelName::FEATURE},
+                                  {Tensor::DataChannelName::BATCH}};
+                    // dispatchData.lws = {1, 1, indices.Batch().v};
                     break;
                 case 5:
                     dispatchData.gws = {indices.X().v * indices.Y().v, indices.Z().v * indices.Feature().v, indices.Batch().v};
-                    dispatchData.lws = {1, 1, indices.Batch().v};
+                    dims_by_gws = {{Tensor::DataChannelName::X, Tensor::DataChannelName::Y},
+                                  {Tensor::DataChannelName::Z, Tensor::DataChannelName::FEATURE},
+                                  {Tensor::DataChannelName::BATCH}};
+                    // dispatchData.lws = {1, 1, indices.Batch().v};
                     break;
                 case 6:
                     dispatchData.gws = {indices.X().v * indices.Y().v, indices.Z().v * indices.W().v, indices.Feature().v * indices.Batch().v};
-                    dispatchData.lws = {1, 1, indices.Batch().v};
+                    dims_by_gws = {{Tensor::DataChannelName::X, Tensor::DataChannelName::Y},
+                                  {Tensor::DataChannelName::Z, Tensor::DataChannelName::W},
+                                  {Tensor::DataChannelName::FEATURE, Tensor::DataChannelName::BATCH}};
+                    // dispatchData.lws = {1, 1, indices.Batch().v};
                     break;
                 default:
                     throw std::invalid_argument("Unsupported data layout for scatter elements update primitive");
                     break;
               }
+              // Use the same optimal LWS calculation as the else branch
+              dispatchData.lws = GetOptimalLocalWorkGroupSizes(dispatchData.gws, params.engineInfo, in_layout, out_layout, dims_by_gws);
         } else {
             switch (rank) {
                 case 4:
@@ -274,6 +285,14 @@ KernelsData ScatterElementsUpdateKernelRef::GetKernelsData(const Params& params)
         auto entry_point = GetEntryPoint(kernelName, newParams.layerID, params, i);
         clKernelData& kernel = kd.kernels[i];
 
+        // Debug output for dispatchData
+        std::cout << "GetKernelsData: dispatchData valid, gws=[" << dispatchData.gws[0] << ","
+                  << dispatchData.gws[1] << "," << dispatchData.gws[2] << "]" << std::endl;
+        std::cout << "GetKernelsData: dispatchData valid, lws=[" << dispatchData.lws[0] << ","
+                  << dispatchData.lws[1] << "," << dispatchData.lws[2] << "], params.engineInfo.maxWorkGroupSize="
+                  << params.engineInfo.maxWorkGroupSize << std::endl;
+
+
         cldnn_jit.RemoveConstant("ITER");
         cldnn_jit.AddConstant(MakeJitConstant("ITER", i));
 
@@ -285,8 +304,13 @@ KernelsData ScatterElementsUpdateKernelRef::GetKernelsData(const Params& params)
             kd.kernels[i].params.local_memory_args.push_back(buffer_size);
         }
 
-        FillCLKernelData(kernel, dispatchData, params.engineInfo, kernelName, jit, entry_point, "", false, false, 3, GetFusedPrimitiveInputsCount(params), 1,
-            params.is_shape_agnostic);
+        try {
+            FillCLKernelData(kernel, dispatchData, params.engineInfo, kernelName, jit, entry_point, "",
+                             false, false, 3, GetFusedPrimitiveInputsCount(params), 1, params.is_shape_agnostic);
+        } catch (const std::exception& e) {
+            std::cout << "GetKernelsData: Exception in iteration " << i << ": " << e.what() << std::endl;
+            throw;
+        }
 
         uint32_t buf_idx = 0;
 

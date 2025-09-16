@@ -152,6 +152,29 @@ std::vector<T> getValues(const std::vector<float> &values) {
     return result;
 }
 
+// Enhanced getValues for large data - generates repeated pattern efficiently
+template<typename T>
+std::vector<T> getLargeValues(size_t total_size, const std::vector<float> &pattern) {
+    if (pattern.empty()) return std::vector<T>(total_size, T(0));
+
+    std::vector<T> result;
+    result.reserve(total_size);
+
+    // Only generate pattern for first few elements, then fill the rest efficiently
+    size_t pattern_limit = std::min(total_size, size_t(100));  // Only compute first 100 elements
+    for (size_t i = 0; i < pattern_limit; ++i) {
+        result.push_back(static_cast<T>(pattern[i % pattern.size()]));
+    }
+
+    // Fill remaining elements with the first pattern value
+    if (total_size > pattern_limit) {
+        T fill_value = static_cast<T>(pattern[0]);
+        result.resize(total_size, fill_value);
+    }
+
+    return result;
+}
+
 template<typename T, typename T_IND>
 std::vector<ScatterElementsUpdateParams<T, T_IND>> generateScatterElementsUpdateParams2D() {
     const std::vector<ScatterElementsUpdateParams<T, T_IND> > result = {
@@ -237,6 +260,45 @@ std::vector<ScatterElementsUpdateParams<T, T_IND>> generateScatterElementsUpdate
             tensor{1, 2, 1, 2, 1, 1},
             getValues<T_IND>({1, 0, 0, 1}),
             getValues<T>({10, 11, 12, 13}),
+        },
+    };
+
+    return result;
+}
+
+// Generate test parameters for large batch sizes that trigger LWS constraints (CVS-171210)
+// These test cases specifically target batch_size > maxWorkGroupSize (1024) to validate
+// the LWS constraint fix in the second kernel (is_second=true) for reduction modes
+// Note: We use getLargeValues to maintain consistency with existing getValues pattern
+template<typename T, typename T_IND>
+std::vector<ScatterElementsUpdateParams<T, T_IND>> generateScatterElementsUpdateLargeBatchParams() {
+    const std::vector<ScatterElementsUpdateParams<T, T_IND>> result = {
+        // Test case 1: batch_size=2048, feature dimension axis=1
+        // This triggers LWS constraint when indices.Batch().v = 2048 > maxWorkGroupSize(1024)
+        {   1,  // axis = feature dimension
+            tensor{2048, 4, 1, 1},  // data: 2048x4x1x1
+            getLargeValues<T>(2048 * 4, {0, 1, 2, 3}),  // Simple pattern like existing getValues
+            tensor{2048, 2, 1, 1},  // indices: 2048x2x1x1 (batch=2048 > 1024)
+            getLargeValues<T_IND>(2048 * 2, {0, 2}),  // Target indices 0 and 2
+            getLargeValues<T>(2048 * 2, {1000, 2000}),  // Alternating update values
+        },
+        // Test case 2: batch_size=1536, feature dimension axis=1 with conflicting indices
+        // This tests reduction mode accuracy when multiple indices target same location
+        {   1,  // axis = feature dimension
+            tensor{1536, 4, 1, 1},  // data: 1536x4x1x1
+            getLargeValues<T>(1536 * 4, {0, 1, 2, 3}),  // Simple incremental pattern
+            tensor{1536, 2, 1, 1},  // indices: 1536x2x1x1 (batch=1536 > 1024)
+            getLargeValues<T_IND>(1536 * 2, {2, 2}),  // Both target same index for reduction test
+            getLargeValues<T>(1536 * 2, {10, 20}),  // Values for SUM reduction (10+20=30)
+        },
+        // Test case 3: batch_size=1280, different axis (Y dimension)
+        // This tests LWS constraint on different tensor dimension layouts
+        {   2,  // axis = Y dimension
+            tensor{1280, 1, 2, 2},  // data: 1280x1x2x2
+            getLargeValues<T>(1280 * 1 * 2 * 2, {0, 1, 2, 3}),  // Simple pattern
+            tensor{1280, 1, 2, 1},  // indices: 1280x1x2x1 (batch=1280 > 1024)
+            getLargeValues<T_IND>(1280 * 1 * 2 * 1, {0, 1}),  // Y dimension indices
+            getLargeValues<T>(1280 * 1 * 2 * 1, {100, 200}),  // Simple update values
         },
     };
 
@@ -639,6 +701,39 @@ INSTANTIATE_TEST_SUITE_P(scatter_elements_update_gpu_reduction_test_f32_4d,
                                  ::testing::ValuesIn(reduce_modes),
                                  ::testing::ValuesIn({true, false}),
                                  ::testing::Values(format::bfwzyx)
+                         ),
+                         PrintToStringParamName());
+
+// Large batch size tests for LWS constraint validation (CVS-171210)
+// These tests specifically target the fix for batch_size > maxWorkGroupSize (1024)
+// in the second kernel (is_second=true) when using reduction modes
+INSTANTIATE_TEST_SUITE_P(scatter_elements_update_gpu_reduction_large_batch_f32,
+                         scatter_elements_update_gpu_reduction_test_f32,
+                         ::testing::Combine(
+                                 ::testing::ValuesIn(generateScatterElementsUpdateLargeBatchParams<float, int32_t>()),
+                                 ::testing::ValuesIn(reduce_modes),  // Reuse existing full reduction modes
+                                 ::testing::Values(true),
+                                 ::testing::Values(format::bfyx)
+                         ),
+                         PrintToStringParamName());
+
+INSTANTIATE_TEST_SUITE_P(scatter_elements_update_gpu_reduction_large_batch_f16,
+                         scatter_elements_update_gpu_reduction_test_f16,
+                         ::testing::Combine(
+                                 ::testing::ValuesIn(generateScatterElementsUpdateLargeBatchParams<ov::float16, int32_t>()),
+                                 ::testing::ValuesIn(reduce_modes),  // Reuse existing full reduction modes
+                                 ::testing::Values(true),
+                                 ::testing::Values(format::bfyx)
+                         ),
+                         PrintToStringParamName());
+
+INSTANTIATE_TEST_SUITE_P(scatter_elements_update_gpu_reduction_large_batch_i32,
+                         scatter_elements_update_gpu_reduction_test_i32,
+                         ::testing::Combine(
+                                 ::testing::ValuesIn(generateScatterElementsUpdateLargeBatchParams<int32_t, int32_t>()),
+                                 ::testing::ValuesIn(reduce_modes),  // Reuse existing full reduction modes
+                                 ::testing::Values(true),
+                                 ::testing::Values(format::bfyx)
                          ),
                          PrintToStringParamName());
 
