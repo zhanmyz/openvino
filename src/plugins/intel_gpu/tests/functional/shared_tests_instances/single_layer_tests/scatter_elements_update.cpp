@@ -151,7 +151,7 @@ const std::vector<ov::element::Type> lwsTestPrecisions = {
 
 // Separate test suites for each batch size to avoid parameter mismatch
 INSTANTIATE_TEST_SUITE_P(
-    lws_constraint_batch2048_ScatterEltsUpdate12,
+    smoke_lws_constraint_batch2048_ScatterEltsUpdate12,
     ScatterElementsUpdate12LayerTest,
     ::testing::Combine(::testing::ValuesIn(combine_shapes(batch2048Shapes)),
                        ::testing::ValuesIn(batch2048Indices),
@@ -163,7 +163,7 @@ INSTANTIATE_TEST_SUITE_P(
     ScatterElementsUpdate12LayerTest::getTestCaseName);
 
 INSTANTIATE_TEST_SUITE_P(
-    lws_constraint_batch1536_ScatterEltsUpdate12,
+    smoke_lws_constraint_batch1536_ScatterEltsUpdate12,
     ScatterElementsUpdate12LayerTest,
     ::testing::Combine(::testing::ValuesIn(combine_shapes(batch1536Shapes)),
                        ::testing::ValuesIn(batch1536Indices),
@@ -175,7 +175,7 @@ INSTANTIATE_TEST_SUITE_P(
     ScatterElementsUpdate12LayerTest::getTestCaseName);
 
 INSTANTIATE_TEST_SUITE_P(
-    lws_constraint_batch1280_ScatterEltsUpdate12,
+    smoke_lws_constraint_batch1280_ScatterEltsUpdate12,
     ScatterElementsUpdate12LayerTest,
     ::testing::Combine(::testing::ValuesIn(combine_shapes(batch1280Shapes)),
                        ::testing::ValuesIn(batch1280Indices),
