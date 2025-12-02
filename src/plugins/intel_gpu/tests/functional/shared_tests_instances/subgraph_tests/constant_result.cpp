@@ -19,11 +19,9 @@ const std::vector<ov::Shape> shapes = {
     {2, 3, 4, 5}
 };
 
-const std::vector<ov::element::Type> model_types = {
+const std::vector<ov::element::Type> model_types_smoke = {
     ov::element::u8,
     ov::element::i8,
-    ov::element::u16,
-    ov::element::i16,
     ov::element::i32,
     ov::element::u64,
     ov::element::i64,
@@ -31,11 +29,24 @@ const std::vector<ov::element::Type> model_types = {
     ov::element::boolean
 };
 
+const std::vector<ov::element::Type> model_types_nightly = {
+    ov::element::u16,
+    ov::element::i16
+};
+
 INSTANTIATE_TEST_SUITE_P(smoke_Check, ConstantResultSubgraphTest,
                         ::testing::Combine(
                             ::testing::ValuesIn(types),
                             ::testing::ValuesIn(shapes),
-                            ::testing::ValuesIn(model_types),
+                            ::testing::ValuesIn(model_types_smoke),
+                            ::testing::Values(ov::test::utils::DEVICE_GPU)),
+                        ConstantResultSubgraphTest::getTestCaseName);
+
+INSTANTIATE_TEST_SUITE_P(nightly_Check, ConstantResultSubgraphTest,
+                        ::testing::Combine(
+                            ::testing::ValuesIn(types),
+                            ::testing::ValuesIn(shapes),
+                            ::testing::ValuesIn(model_types_nightly),
                             ::testing::Values(ov::test::utils::DEVICE_GPU)),
                         ConstantResultSubgraphTest::getTestCaseName);
 }  // namespace
