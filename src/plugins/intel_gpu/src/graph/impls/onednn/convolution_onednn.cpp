@@ -32,6 +32,110 @@ static std::shared_ptr<dnnl::convolution_forward::primitive_desc> get_convolutio
     auto weights_layout = impl_params.get_input_layout(1);
     auto output_layout = impl_params.get_output_layout();
     auto auto_pad = prim->auto_pad;
+    
+    // Debug ALL convolutions to understand groups parameter
+    std::cerr << "[DEBUG] Conv: name=" << impl_params.desc->id 
+              << ", groups=" << prim->groups 
+              << ", input_channels=" << input_layout.feature()
+              << ", weights_shape=[";
+    auto ws = weights_layout.get_shape();
+    for (size_t i = 0; i < ws.size(); i++) {
+        if (i > 0) std::cerr << ",";
+        std::cerr << ws[i];
+    }
+    std::cerr << "]" << std::endl;
+    
+    // For grouped convolutions, check if we need to recover the correct weights shape/format
+    // This handles the case where GroupConvolution with groups=input_channels (depthwise)
+    // had its weights incorrectly simplified or has wrong format
+    if (prim->groups > 1 && prim->groups == input_layout.feature()) {
+        auto weights_shape = weights_layout.get_shape();
+        auto weights_tensor = weights_layout.get_tensor();
+        
+        std::cerr << "[DEBUG] Depthwise grouped conv detected: groups=" << prim->groups
+                  << ", input_channels=" << input_layout.feature()
+                  << ", weights_shape=[";
+        for (size_t i = 0; i < weights_shape.size(); i++) {
+            if (i > 0) std::cerr << ",";
+            std::cerr << weights_shape[i];
+        }
+        std::cerr << "], format=" << weights_layout.format.to_string() << std::endl;
+        std::cerr << "  weights_tensor: batch[0]=" << weights_tensor.batch[0]
+                  << ", feature[0]=" << weights_tensor.feature[0]
+                  << ", spatial[0]=" << weights_tensor.spatial[0]
+                  << ", spatial[1]=" << weights_tensor.spatial[1] << std::endl;
+        
+        // Case 1: Weights have correct 4D shape [G,O/G,I,K] but wrong format (bfyx instead of goiyx)
+        // For 1D depthwise conv with kernel_size K: shape should be [groups, 1, 1, K]
+        // In bfyx format: batch=G, feature=O/G, spatial[0]=kernel_x, spatial[1]=kernel_y
+        // OpenVINO treats 1D conv as 2D with Y=1, so we need 5D: [G, O/G, I, Y=1, X=K]
+        if (weights_shape.size() == 4 &&
+            weights_tensor.batch[0] == prim->groups &&
+            weights_tensor.feature[0] <= 1 &&
+            weights_tensor.spatial[1] == 1) {  // Y dimension == 1 means 1D conv treated as 2D
+            
+            // Extract kernel size from spatial[0] (X dimension)
+            int kernel_size = weights_tensor.spatial[0];
+            
+            std::cerr << "  4D shape detected with kernel_size=" << kernel_size << std::endl;
+            std::cerr << "  Converting to 5D goiyx format: [G=" << prim->groups 
+                      << ",O/G=1,I=1,Y=1,X=" << kernel_size << "]" << std::endl;
+            
+            // Create correct 5D shape for grouped convolution
+            // goiyx format: [groups, output_per_group, input_per_group, kernel_y, kernel_x]
+            ov::PartialShape goiyx_shape = {
+                static_cast<ov::Dimension::value_type>(prim->groups),        // G = 192
+                static_cast<ov::Dimension::value_type>(1),                    // O/G = 1
+                static_cast<ov::Dimension::value_type>(1),                    // I = 1
+                static_cast<ov::Dimension::value_type>(weights_tensor.spatial[1]),  // Y from spatial[1]
+                static_cast<ov::Dimension::value_type>(kernel_size)           // X from spatial[0]
+            };
+            
+            // Update layout with goiyx format and 5D shape
+            weights_layout.format = format::get_default_format(5, true, true);  // goiyx format
+            weights_layout.set_partial_shape(goiyx_shape);
+            
+            std::cerr << "  Reconstructed weights_layout: " << weights_layout.to_short_string() << std::endl;
+        }
+        // Case 2: Weights are missing the kernel dimension entirely
+        // Expected: [G, out_per_group, in_per_group, Y, X] for 2D grouped conv (goiyx format, 5D)
+        // Actual might be: [G, in_per_group, 1] (3D) missing kernel dimensions
+        else if (weights_shape.size() == 3 && 
+            weights_tensor.batch[0] == prim->groups &&
+            weights_tensor.feature[0] <= 1 &&
+            weights_tensor.spatial[0] == 1 && weights_tensor.spatial[1] == 1) {
+            
+            // Try to infer kernel size from dilation and stride
+            // For 1D conv, kernel size is often 3, 5, 7, etc.
+            // We can also check the actual memory size if available
+            int likely_kernel_size = 3;  // Common default for 1D depthwise conv
+            
+            std::cerr << "  Likely missing kernel dimension. Inferring kernel_size=" << likely_kernel_size << std::endl;
+            std::cerr << "  Reconstructing weights shape to 5D for goiyx format" << std::endl;
+            std::cerr << "  From: [" << weights_tensor.batch[0] << ","
+                      << weights_tensor.feature[0] << "," << weights_tensor.spatial[0] << "]" << std::endl;
+            std::cerr << "  To: [G=" << weights_tensor.batch[0] << ", O=" 
+                      << weights_tensor.feature[0] << ", I=" 
+                      << weights_tensor.spatial[0] << ","
+                      << "Y=" << 1 << ", X=" << likely_kernel_size << "]" << std::endl;
+            
+            // Create a new 5D grouped tensor: goiyx format = group(G), batch(O), feature(I), spatial(Y, X)
+            // For depthwise 1D conv: groups=192, output_per_group=1, input_per_group=1, y=1, kernel_x=3
+            cldnn::tensor new_tensor(
+                group(static_cast<int32_t>(weights_tensor.batch[0])),      // groups (G)
+                batch(static_cast<int32_t>(weights_tensor.feature[0])),    // output_per_group (O)
+                feature(static_cast<int32_t>(weights_tensor.spatial[0])),  // input_per_group (I)
+                spatial(static_cast<int32_t>(likely_kernel_size),          // kernel_x (X)
+                        static_cast<int32_t>(1))                           // kernel_y (Y) = 1 for 1D conv
+            );
+            
+            // Update the layout with correct 5D shape and grouped format (goiyx)
+            weights_layout.set_tensor(new_tensor);
+            weights_layout.format = format::get_default_format(5, true, true);  // goiyx format
+            
+            std::cerr << "  Reconstructed weights_layout: " << weights_layout.to_short_string() << std::endl;
+        }
+    }
 
     // issue: it could not find the implementation for 1d kernel GroupConvolution from onednn.
     // root-cause: 3d tensor of input/output is changed to 4d via ngraph.
@@ -45,22 +149,151 @@ static std::shared_ptr<dnnl::convolution_forward::primitive_desc> get_convolutio
     //       input2: [280,   1,   67,  1]
     //       output: [  1, 280, 1200,  1]
     // WA: Weight tensor will be updated from 4d to 5d.
+    // Note: This also handles the case where weights_layout has been incorrectly simplified to non-grouped format
+    // (e.g., bfyx instead of goiyx) while still containing 1D convolution kernel data.
     auto grouped_weights = format::is_grouped(weights_layout.format) || prim->grouped_weights_shape;
-    if (grouped_weights && (input_layout.get_rank() == weights_layout.get_rank())) {
+    
+    std::cerr << "[DEBUG] Convolution check: grouped_weights=" << grouped_weights 
+              << ", prim->grouped_weights_shape=" << prim->grouped_weights_shape
+              << ", input_rank=" << input_layout.get_rank()
+              << ", input_spatial_rank=" << input_layout.get_spatial_rank()
+              << ", weights_format=" << weights_layout.format.to_string()
+              << ", is_grouped=" << format::is_grouped(weights_layout.format) << std::endl;
+    
+    // Additional heuristic: detect if this is actually a grouped 1D convolution that was incorrectly 
+    // identified as regular convolution. Characteristics:
+    // - Input is 3D (batch, channels, spatial) or 4D with only 1 spatial dimension used
+    // - Weights should be goix (group, out_per_group, in_per_group, kernel_x) but might be bfyx
+    // - The "batch" dimension of weights equals input channels (indicating groups)
+    // - The "feature" dimension of weights is small (out_per_group)
+    auto weights_tensor = weights_layout.get_tensor();
+    if (!grouped_weights && input_layout.feature() > 1) {
+        std::cerr << "[DEBUG] Heuristic check: input_feature=" << input_layout.feature()
+                  << ", weights_tensor.batch=" << weights_tensor.batch[0]
+                  << ", weights_tensor.feature=" << weights_tensor.feature[0]
+                  << ", spatial=[" << weights_tensor.spatial[0] << "," << weights_tensor.spatial[1] << "," << weights_tensor.spatial[2] << "]"
+                  << std::endl;
+        
+        // Check if weights "batch" equals input channels (typical for depthwise/grouped conv)
+        // and spatial pattern suggests 1D convolution
+        bool has_1d_kernel = (weights_tensor.spatial[0] > 1 && weights_tensor.spatial[1] == 1 && weights_tensor.spatial[2] == 1) ||
+                            (weights_tensor.spatial[1] > 1 && weights_tensor.spatial[0] == 1 && weights_tensor.spatial[2] == 1);
+        
+        std::cerr << "[DEBUG] has_1d_kernel=" << has_1d_kernel 
+                  << ", batch==feature? " << (weights_tensor.batch[0] == input_layout.feature())
+                  << ", feature==1? " << (weights_tensor.feature[0] == 1) << std::endl;
+        
+        if (weights_tensor.batch[0] == input_layout.feature() && 
+            weights_tensor.feature[0] == 1 &&
+            has_1d_kernel) {
+            grouped_weights = true;  // Override the flag
+            std::cerr << "[DEBUG] Detected misidentified 1D grouped convolution! weights_tensor: ["
+                      << weights_tensor.batch[0] << "," << weights_tensor.feature[0] << ","
+                      << weights_tensor.spatial[0] << "," << weights_tensor.spatial[1] << "]" << std::endl;
+        }
+    }
+    
+    // Check if this is a 1D grouped convolution that needs weight format upgrade:
+    // - Either format is already grouped, OR primitive indicates grouped weights
+    // - Input has 3D spatial shape (1D convolution)
+    // - Weights need to be upgraded to 5D for oneDNN compatibility
+    bool is_1d_grouped_conv = grouped_weights && (input_layout.get_spatial_rank() == 1 || 
+                                                   (input_layout.get_rank() == 3) ||
+                                                   (input_layout.get_rank() == 4 && input_layout.spatial(1) == 1 && input_layout.spatial(2) == 1));
+    
+    if (is_1d_grouped_conv) {
         auto tensor = weights_layout.get_tensor();
+        
+        std::cerr << "[DEBUG] 1D grouped conv detected, weights_layout before fix: " << weights_layout.to_short_string() << std::endl;
+        std::cerr << "  tensor.batch: " << tensor.batch[0] << std::endl;
+        std::cerr << "  tensor.feature: " << tensor.feature[0] << std::endl;
+        std::cerr << "  tensor.spatial[0]: " << tensor.spatial[0] << std::endl;
+        std::cerr << "  tensor.spatial[1]: " << tensor.spatial[1] << std::endl;
+        std::cerr << "  tensor.spatial[2]: " << tensor.spatial[2] << std::endl;
+        std::cerr << "  weights_layout.get_rank(): " << weights_layout.get_rank() << std::endl;
+        std::cerr << "  format::is_grouped(weights_layout.format): " << format::is_grouped(weights_layout.format) << std::endl;
+        
+        // If weights format is not grouped (e.g., incorrectly simplified to bfyx),
+        // we need to restore it based on the actual tensor shape
+        if (!format::is_grouped(weights_layout.format) && prim->grouped_weights_shape) {
+            // Reconstruct the correct grouped format based on tensor rank
+            // The tensor should contain the correct 4D data even if layout format is wrong
+            weights_layout.format = format::get_default_format(weights_layout.get_rank(), true, true);
+            std::cerr << "  Restored grouped format: " << weights_layout.format.to_string() << std::endl;
+        }
+        
         if (tensor.spatial[0] == 1 && tensor.spatial[1] != 1) {
             std::swap(tensor.spatial[0], tensor.spatial[1]);
             weights_layout.set_tensor(tensor);
+            std::cerr << "  Swapped spatial[0] and spatial[1]" << std::endl;
         }
+        // Upgrade to 5D for oneDNN (which doesn't support 1D grouped conv directly)
         weights_layout.format = format::get_default_format(weights_layout.get_rank() + 1, true, true);
+        std::cerr << "  Final weights_layout: " << weights_layout.to_short_string() << std::endl;
     }
 
     auto [input_md, weights_md, output_md] = onednn::get_conv_memory_descs(input_layout, weights_layout, output_layout, tag_in_out);
+
+    std::cerr << "[DEBUG] Memory descriptors for " << impl_params.desc->id << ":" << std::endl;
+    std::cerr << "  input_md dims: [";
+    for (size_t i = 0; i < input_md.get_dims().size(); i++) {
+        if (i > 0) std::cerr << ",";
+        std::cerr << input_md.get_dims()[i];
+    }
+    std::cerr << "], format_kind=" << static_cast<int>(input_md.get_format_kind()) << std::endl;
+    std::cerr << "  weights_md dims: [";
+    for (size_t i = 0; i < weights_md.get_dims().size(); i++) {
+        if (i > 0) std::cerr << ",";
+        std::cerr << weights_md.get_dims()[i];
+    }
+    std::cerr << "], format_kind=" << static_cast<int>(weights_md.get_format_kind()) << std::endl;
+    std::cerr << "  output_md dims: [";
+    for (size_t i = 0; i < output_md.get_dims().size(); i++) {
+        if (i > 0) std::cerr << ",";
+        std::cerr << output_md.get_dims()[i];
+    }
+    std::cerr << "], format_kind=" << static_cast<int>(output_md.get_format_kind()) << std::endl;
+    std::cerr << "  groups=" << prim->groups << std::endl;
+    std::cerr << "  stride=[";
+    for (size_t i = 0; i < prim->stride.size(); i++) {
+        if (i > 0) std::cerr << ",";
+        std::cerr << prim->stride[i];
+    }
+    std::cerr << "], dilation=[";
+    for (size_t i = 0; i < prim->dilation.size(); i++) {
+        if (i > 0) std::cerr << ",";
+        std::cerr << prim->dilation[i];
+    }
+    std::cerr << "], pad_begin=[";
+    for (size_t i = 0; i < prim->padding_begin.size(); i++) {
+        if (i > 0) std::cerr << ",";
+        std::cerr << prim->padding_begin[i];
+    }
+    std::cerr << "], pad_end=[";
+    for (size_t i = 0; i < prim->padding_end.size(); i++) {
+        if (i > 0) std::cerr << ",";
+        std::cerr << prim->padding_end[i];
+    }
+    std::cerr << "]" << std::endl;
 
     dnnl::memory::dims stride(prim->stride.begin(), prim->stride.end());
     dnnl::memory::dims dilation(prim->dilation.begin(), prim->dilation.end());
     dnnl::memory::dims pad_l(prim->padding_begin.begin(), prim->padding_begin.end());
     dnnl::memory::dims pad_r(prim->padding_end.begin(), prim->padding_end.end());
+
+    // For 1D convolutions with 5D weights (goiyx format), we need 2D spatial parameters
+    // OpenVINO treats 1D conv as 2D with Y=1, so we need to expand parameters early
+    if (weights_md.get_dims().size() == 5 && stride.size() == 1) {
+        // Insert Y dimension parameters at the beginning
+        stride.insert(stride.begin(), 1);      // stride_y = 1
+        dilation.insert(dilation.begin(), 1);  // dilation_y = 1  
+        pad_l.insert(pad_l.begin(), 0);        // pad_y_begin = 0
+        pad_r.insert(pad_r.begin(), 0);        // pad_y_end = 0
+        
+        std::cerr << "[DEBUG] Extended 1D params to 2D for 5D weights: "
+                  << "stride=[" << stride[0] << "," << stride[1] << "], "
+                  << "dilation=[" << dilation[0] << "," << dilation[1] << "]" << std::endl;
+    }
 
     if (auto_pad == ov::op::PadType::SAME_UPPER || auto_pad == ov::op::PadType::SAME_LOWER) {
         ov::op::v1::Convolution op;
@@ -104,6 +337,32 @@ static std::shared_ptr<dnnl::convolution_forward::primitive_desc> get_convolutio
         dilation.insert(dilation.end(), insert_count, 0);
         pad_l.insert(pad_l.end(), insert_count, 0);
         pad_r.insert(pad_r.end(), insert_count, 0);
+    }
+
+    // Debug: log final parameters before creating primitive descriptor
+    if (prim->groups > 1) {
+        std::cerr << "[DEBUG] Final params for " << impl_params.desc->id << ":" << std::endl;
+        std::cerr << "  stride=[";
+        for (size_t i = 0; i < stride.size(); i++) {
+            if (i > 0) std::cerr << ",";
+            std::cerr << stride[i];
+        }
+        std::cerr << "], dilation=[";
+        for (size_t i = 0; i < dilation.size(); i++) {
+            if (i > 0) std::cerr << ",";
+            std::cerr << dilation[i];
+        }
+        std::cerr << "], pad_l=[";
+        for (size_t i = 0; i < pad_l.size(); i++) {
+            if (i > 0) std::cerr << ",";
+            std::cerr << pad_l[i];
+        }
+        std::cerr << "], pad_r=[";
+        for (size_t i = 0; i < pad_r.size(); i++) {
+            if (i > 0) std::cerr << ",";
+            std::cerr << pad_r[i];
+        }
+        std::cerr << "]" << std::endl;
     }
 
     if (prim->bias.is_valid()) {
@@ -257,6 +516,38 @@ protected:
         auto cldnn_prim = impl_params.typed_desc<convolution>();
 
         auto source_weights_layout = impl_params.get_input_layout(1);
+        auto input_layout = impl_params.get_input_layout(0);
+        
+        // Apply the same reconstruction as in get_convolution_primitive_descriptor
+        // This ensures weights reorder sees the corrected 5D shape
+        if (cldnn_prim->groups > 1 && cldnn_prim->groups == input_layout.feature()) {
+            auto weights_shape = source_weights_layout.get_shape();
+            auto weights_tensor = source_weights_layout.get_tensor();
+            
+            // Case 1: 4D bfyx weights that need to be 5D goiyx
+            if (weights_shape.size() == 4 &&
+                weights_tensor.batch[0] == cldnn_prim->groups &&
+                weights_tensor.feature[0] <= 1 &&
+                weights_tensor.spatial[1] == 1) {
+                
+                int kernel_size = weights_tensor.spatial[0];
+                
+                ov::PartialShape goiyx_shape = {
+                    static_cast<ov::Dimension::value_type>(cldnn_prim->groups),
+                    static_cast<ov::Dimension::value_type>(1),
+                    static_cast<ov::Dimension::value_type>(1),
+                    static_cast<ov::Dimension::value_type>(weights_tensor.spatial[1]),
+                    static_cast<ov::Dimension::value_type>(kernel_size)
+                };
+                
+                source_weights_layout.format = format::get_default_format(5, true, true);
+                source_weights_layout.set_partial_shape(goiyx_shape);
+                
+                std::cerr << "[DEBUG] get_weights_reorder: Reconstructed source_weights_layout to " 
+                          << source_weights_layout.to_short_string() << std::endl;
+            }
+        }
+        
         auto grouped_weights = format::is_grouped(source_weights_layout.format) || cldnn_prim->grouped_weights_shape;
         auto target_weights_desc = pd.weights_desc(0);
 

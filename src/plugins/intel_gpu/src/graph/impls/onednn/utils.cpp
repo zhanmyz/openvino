@@ -41,8 +41,18 @@ cldnn::format default_fmt_for_dims(size_t dims, bool is_grouped) {
 }
 
 dnnl::memory::dims convert_tensor(cldnn::tensor t, size_t dims, bool is_grouped) {
-    auto sizes = t.sizes(default_fmt_for_dims(dims, is_grouped));
+    auto fmt = default_fmt_for_dims(dims, is_grouped);
+    auto sizes = t.sizes(fmt);
     dnnl::memory::dims res(sizes.begin(), sizes.end());
+    
+    std::cerr << "[DEBUG] convert_tensor: dims=" << dims << ", is_grouped=" << is_grouped 
+              << ", fmt=" << fmt.to_string() << ", result=[";
+    for (size_t i = 0; i < res.size(); i++) {
+        if (i > 0) std::cerr << ",";
+        std::cerr << res[i];
+    }
+    std::cerr << "]" << std::endl;
+    
     return res;
 }
 
@@ -299,6 +309,17 @@ static const std::map<cldnn::format::type, dnnl::memory::format_tag> format_map_
 
 std::tuple<dnnl::memory::desc, dnnl::memory::desc, dnnl::memory::desc>
 get_conv_memory_descs(cldnn::layout input_layout, cldnn::layout weights_layout, cldnn::layout output_layout, dnnl::memory::format_tag target_fmt) {
+    std::cerr << "[DEBUG] get_conv_memory_descs called:" << std::endl;
+    std::cerr << "  weights_layout: " << weights_layout.to_short_string() << std::endl;
+    auto weights_shape = weights_layout.get_shape();
+    std::cerr << "  weights_shape: [";
+    for (size_t i = 0; i < weights_shape.size(); i++) {
+        if (i > 0) std::cerr << ",";
+        std::cerr << weights_shape[i];
+    }
+    std::cerr << "]" << std::endl;
+    std::cerr << "  weights_rank: " << weights_layout.get_rank() << std::endl;
+    
     mem_flags flag = (input_layout.format.is_blocked() || output_layout.format.is_blocked()) ? mem_flags::need_blocked : mem_flags::None;
     flag = format::is_grouped(weights_layout.format) ? mem_flags::grouped : flag;
     dnnl::memory::desc input_desc   = layout_to_memory_desc(input_layout, target_fmt, flag);
@@ -327,6 +348,28 @@ inline bool has_mem_flag(mem_flags flags, mem_flags flag_to_check) {
 }
 
 dnnl::memory::desc layout_to_memory_desc(cldnn::layout l, dnnl::memory::format_tag target_fmt, mem_flags flags) {
+    // For custom format, use the actual shape from layout since keep_weights_reorder_shape_consistent
+    // should have already updated it to match the oneDNN descriptor dims
+    if (l.format == cldnn::format::custom) {
+        auto shape = l.get_shape();
+        dnnl::memory::dims dims(shape.begin(), shape.end());
+        
+        std::cerr << "[DEBUG] Custom format layout_to_memory_desc:" << std::endl;
+        std::cerr << "  Shape: [";
+        for (size_t i = 0; i < shape.size(); i++) {
+            if (i > 0) std::cerr << ",";
+            std::cerr << shape[i];
+        }
+        std::cerr << "]" << std::endl;
+        std::cerr << "  Format dimension: " << cldnn::format::dimension(l.format) << std::endl;
+        std::cerr << "  target_fmt: " << (target_fmt == dnnl::memory::format_tag::any ? "any" : "specific") << std::endl;
+        std::cerr << "  Dims size: " << dims.size() << std::endl;
+        
+        dnnl::memory::data_type dt = convert_data_type(l.data_type);
+        dnnl::memory::desc res(dims, dt, dnnl::memory::format_tag::any);
+        return res;
+    }
+    
     dnnl::memory::dims dims;
     bool flatten = has_mem_flag(flags, mem_flags::flatten);
     bool use_strides = has_mem_flag(flags, mem_flags::use_strides);
@@ -372,9 +415,10 @@ dnnl::memory::desc layout_to_memory_desc(cldnn::layout l, dnnl::memory::format_t
     } else {
         // clDNN expresses 3d tensor with 4d format. This code is to use 3d format on oneDNN for such case.
         // However, if the memory::desc to be converted is related to another blocked format, it should be expanded to a 4d tensor.
+        // Custom format should not use this 3D special handling as it doesn't have a standard format tag mapping
         auto shape_rank = l.is_dynamic() ?
             static_cast<size_t>(l.get_partial_shape().rank().get_length()) : l.get_shape().size();
-        if (shape_rank == 3 && !need_blocked && !is_grouped) {
+        if (shape_rank == 3 && !need_blocked && !is_grouped && l.format != cldnn::format::custom) {
             dims.push_back(l.batch());
             dims.push_back(l.feature());
             // In cldnn::layer, when it is a 3D shape, the values ​​of the XY axes can sometimes be flipped,
@@ -662,6 +706,9 @@ template bool is_per_tensor<int32_t>(cldnn::data_node& node, int32_t& zp_val);
 
 
 static std::string get_external_order(const std::vector<size_t>& order, bool is_weights, bool is_grouped) {
+    // Use order.size() which comes from the actual oneDNN memory descriptor ndims
+    // This ensures we get the correct format even when the descriptor has more dims
+    // than the original custom format shape
     cldnn::format default_fmt = format::get_default_format(order.size(), is_weights, is_grouped);
     const auto& default_order = default_fmt.order();
 
@@ -677,6 +724,15 @@ static std::string get_external_order(const std::vector<size_t>& order, bool is_
 cldnn::format_traits convert_memory_desc_to_traits(const dnnl::memory::desc& desc, bool is_weights, bool is_grouped) {
     OPENVINO_ASSERT(desc.get_format_kind() == dnnl::memory::format_kind::blocked, "[GPU] Only blocked memory desc type is supported");
     auto ndims = desc.get_ndims();
+    
+    std::cerr << "[DEBUG] convert_memory_desc_to_traits: ndims=" << ndims << ", is_weights=" << is_weights << std::endl;
+    auto desc_dims = desc.get_dims();
+    std::cerr << "  Desc dims: [";
+    for (int i = 0; i < ndims; i++) {
+        if (i > 0) std::cerr << ",";
+        std::cerr << desc_dims[i];
+    }
+    std::cerr << "]" << std::endl;
     auto inner_nblks = desc.get_inner_nblks();
     auto inner_blks = desc.get_inner_blks();
     auto inner_idxs = desc.get_inner_idxs();
@@ -719,10 +775,49 @@ cldnn::format_traits convert_memory_desc_to_traits(const dnnl::memory::desc& des
     }
     std::string outer_order = get_external_order(order, is_weights, is_grouped);
 
+    std::cerr << "  internal_order: " << internal_order << std::endl;
+    std::cerr << "  outer_order: " << outer_order << std::endl;
+    std::cerr << "  inner_nblks: " << inner_nblks << std::endl;
+
     std::vector<std::pair<size_t, int>> logic_block_sizes(inner_nblks);
     for (int i = 0; i < inner_nblks; i++) {
         auto c = internal_order[block_sizes[i].first];
+        std::cerr << "  block " << i << ": block_sizes[i].first=" << block_sizes[i].first 
+                  << ", char='" << c << "'" << std::endl;
         auto pos = outer_order.find(c);
+        
+        // Handle mismatch: if character not found in outer_order AND it's a group-related character
+        if (pos == std::string::npos && is_weights && (c == 'g' || c == 'o' || c == 'i')) {
+            std::cerr << "  Character '" << c << "' not found in outer_order='" << outer_order << "'" << std::endl;
+            
+            // For weights in non-grouped format, oneDNN may use 'o'/'i' in internal blocks  
+            // These correspond to output/input channels which map to batch/feature dims
+            if (!is_grouped && (c == 'o' || c == 'i')) {
+                // For non-grouped weights: 'o' (output) -> dim 0, 'i' (input) -> dim 1
+                // In order array, we need to find which position corresponds to output/input
+                size_t target_dim = (c == 'o') ? 0 : 1;  // o=output=dim0, i=input=dim1
+                if (target_dim < order.size()) {
+                    logic_block_sizes[i] = std::make_pair(target_dim, inner_blks[i]);
+                    std::cerr << "  Mapped '" << c << "' to dim " << target_dim << std::endl;
+                    continue;
+                }
+            }
+            
+            // If still not found or c=='g', try regenerating with grouped=true
+            std::cerr << "  Attempting to regenerate with is_grouped=true..." << std::endl;
+            std::cerr << "  order.size()=" << order.size() << ", is_weights=" << is_weights << std::endl;
+            // Regenerate outer_order assuming grouped format
+            auto corrected_outer_order = get_external_order(order, is_weights, true);  // Use is_grouped=true
+            std::cerr << "  New outer_order='" << corrected_outer_order << "'" << std::endl;
+            pos = corrected_outer_order.find(c);
+            std::cerr << "  Character '" << c << "' found at pos=" << pos << " in new outer_order" << std::endl;
+            if (pos != std::string::npos) {
+                // Use the corrected order for this lookup
+                logic_block_sizes[i] = std::make_pair(order[pos], inner_blks[i]);
+                continue;  // Skip the normal assignment below
+            }
+        }
+        
         OPENVINO_ASSERT(pos != std::string::npos, "[GPU] Unknown coord type: ", c);
 
         logic_block_sizes[i] = std::make_pair(order[pos], inner_blks[i]);
@@ -754,6 +849,20 @@ bool keep_weights_reorder_shape_consistent(cldnn::layout& layout, const dnnl::me
 
     auto shape = layout.get_shape();
     auto dims = desc.get_dims();
+    
+    std::cerr << "[DEBUG] keep_weights_reorder_shape_consistent:" << std::endl;
+    std::cerr << "  Input shape: [";
+    for (size_t i = 0; i < shape.size(); i++) {
+        if (i > 0) std::cerr << ",";
+        std::cerr << shape[i];
+    }
+    std::cerr << "]" << std::endl;
+    std::cerr << "  Desc dims: [";
+    for (size_t i = 0; i < dims.size(); i++) {
+        if (i > 0) std::cerr << ",";
+        std::cerr << dims[i];
+    }
+    std::cerr << "]" << std::endl;
     std::vector<ov::Dimension::value_type> target_dims;
     std::vector<ov::Dimension::value_type> filtered_target_dims;
     std::transform(shape.begin(), shape.end(), std::back_inserter(target_dims),
@@ -772,7 +881,9 @@ bool keep_weights_reorder_shape_consistent(cldnn::layout& layout, const dnnl::me
         return false; // We cannot keep the shapes consistent
 
     layout.set_partial_shape(desc_dims);
+    std::cerr << "  After set_partial_shape, layout rank: " << layout.get_rank() << ", desc_dims size: " << desc_dims.size() << std::endl;
     if (layout.get_rank() == desc_dims.size()) {
+        std::cerr << "  Returning true (rank matches)" << std::endl;
         return true;
     } else if (layout.get_rank() == 4 && desc_dims.size() == 3) {
         // In the case of a 3D shape, cldnn::layout::get_rank() returns 4.
