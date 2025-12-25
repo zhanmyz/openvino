@@ -712,6 +712,17 @@ void program::transfer_memory_to_device() {
                 continue;
 
             if (!mem_layout.compatible(data_node_layout)) {
+                if (data_node_layout.data_type == mem_layout.data_type &&
+                    data_node_layout.format == mem_layout.format &&
+                    data_node_layout.get_shape() == mem_layout.get_shape()) {
+                    GPU_DEBUG_LOG << "[" << data_node.id() << ": padding fix]" << std::endl;
+                    auto new_mem = mem.get_engine()->allocate_memory(data_node_layout, allocation_type::usm_device, false);
+                    new_mem->copy_from(get_stream(), mem);
+                    data_node.attach_memory(new_mem);
+                    get_stream().finish();
+                    GPU_DEBUG_LOG << "[" << data_node.id() << ": padding fix completed]" << std::endl;
+                    continue;
+                }
                 std::string err_str("Node and memory layouts are incompatible, error occurred for " + node->id() + " node");
                 throw std::invalid_argument(err_str);
             }

@@ -33,6 +33,41 @@ static std::shared_ptr<dnnl::convolution_forward::primitive_desc> get_convolutio
     auto output_layout = impl_params.get_output_layout();
     auto auto_pad = prim->auto_pad;
 
+    // // For grouped convolutions, check if we need to recover the correct weights shape/format
+    // // This handles the case where GroupConvolution with groups=input_channels (depthwise)
+    // // had its weights incorrectly simplified or has wrong format
+    // if (prim->groups > 1 && prim->groups == input_layout.feature()) {
+    //     auto weights_shape = weights_layout.get_shape();
+    //     auto weights_tensor = weights_layout.get_tensor();
+
+    //     // Case 1: Weights have correct 4D shape [G,O/G,I,K] but wrong format (bfyx instead of goiyx)
+    //     // For 1D depthwise conv with kernel_size K: shape should be [groups, 1, 1, K]
+    //     // In bfyx format: batch=G, feature=O/G, spatial[0]=kernel_x, spatial[1]=kernel_y
+    //     // OpenVINO treats 1D conv as 2D with Y=1, so we need 5D: [G, O/G, I, Y=1, X=K]
+    //     if (weights_shape.size() == 4 &&
+    //         weights_tensor.batch[0] == prim->groups &&
+    //         weights_tensor.feature[0] <= 1 &&
+    //         weights_tensor.spatial[1] == 1) {  // Y dimension == 1 means 1D conv treated as 2D
+
+    //         // Extract kernel size from spatial[0] (X dimension)
+    //         int kernel_size = weights_tensor.spatial[0];
+
+    //         // Create correct 5D shape for grouped convolution
+    //         // goiyx format: [groups, output_per_group, input_per_group, kernel_y, kernel_x]
+    //         ov::PartialShape goiyx_shape = {
+    //             static_cast<ov::Dimension::value_type>(prim->groups),        // G = 192
+    //             static_cast<ov::Dimension::value_type>(1),                    // O/G = 1
+    //             static_cast<ov::Dimension::value_type>(1),                    // I = 1
+    //             static_cast<ov::Dimension::value_type>(weights_tensor.spatial[1]),  // Y from spatial[1]
+    //             static_cast<ov::Dimension::value_type>(kernel_size)           // X from spatial[0]
+    //         };
+
+    //         // Update layout with goiyx format and 5D shape
+    //         weights_layout.format = format::get_default_format(5, true, true);  // goiyx format
+    //         weights_layout.set_partial_shape(goiyx_shape);
+    //     }
+    // }
+
     // issue: it could not find the implementation for 1d kernel GroupConvolution from onednn.
     // root-cause: 3d tensor of input/output is changed to 4d via ngraph.
     //             Creating conv description returns error if two inputs have same tensor of data input and weight.
@@ -269,7 +304,12 @@ protected:
         auto traits = convert_memory_desc_to_traits(target_weights_desc, weights_format, grouped_weights);
 
         auto target_weights_layout = source_weights_layout;
-        target_weights_layout.format = format(traits);
+        // CVS-172561: For custom blocking formats from oneDNN, don't try to create a cldnn format
+        // from traits as it may have mismatched internal/external order causing errors.
+        // Instead, keep the source format and rely on target_weights_desc for actual reorder.
+        if (traits.str != "custom") {
+            target_weights_layout.format = format(traits);
+        }
 
         return std::make_shared<WeightsReorderParamsOneDNN>(source_weights_layout,
                                                             target_weights_layout,
@@ -379,7 +419,19 @@ public:
 
         auto attr = get_primitive_attributes(arg, impl_params, zero_point_mask, wzp_data_type);
 
-        auto prim_desc = get_convolution_primitive_descriptor(impl_params, *attr);
+        // Determine the appropriate format tag for depthwise separable convolutions
+        // For depthwise convolutions (groups == input_channels), use nhwc format explicitly
+        // to avoid oneDNN returning custom blocking format which OpenVINO cannot handle.
+        // This fixes: [GPU] Unexpected layout format f16:custom:192x1x1:nopad (CVS-172561)
+        auto prim = impl_params.typed_desc<convolution>();
+        auto input_layout = impl_params.get_input_layout(0);
+        bool is_depthwise_sep_opt = (prim->groups > 1 && prim->groups == input_layout.feature());
+        
+        dnnl::memory::format_tag tag_in_out = is_depthwise_sep_opt 
+                                             ? dnnl::memory::format_tag::nhwc 
+                                             : dnnl::memory::format_tag::undef;
+
+        auto prim_desc = get_convolution_primitive_descriptor(impl_params, *attr, tag_in_out);
 
         auto conv_onednn_impl = std::make_unique<convolution_onednn>(engine, config, attr, *prim_desc,
                                                 get_weights_reorder(impl_params, *prim_desc, arg.get_transposed()));

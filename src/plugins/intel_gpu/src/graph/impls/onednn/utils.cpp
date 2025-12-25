@@ -332,6 +332,22 @@ dnnl::memory::desc layout_to_memory_desc(cldnn::layout l, dnnl::memory::format_t
     bool use_strides = has_mem_flag(flags, mem_flags::use_strides);
     bool need_blocked = has_mem_flag(flags, mem_flags::need_blocked);
     bool is_grouped = has_mem_flag(flags, mem_flags::grouped);
+    
+    // CVS-172561: For custom blocking formats (typically from oneDNN primitives),
+    // we must use strides instead of format tags since custom formats cannot be
+    // represented by standard oneDNN format tags. 
+    // Extract dims directly from the tensor and use layout's pitches as strides.
+    bool is_custom_format = (l.format.to_string() == "custom");
+    if (is_custom_format) {
+        auto rank = cldnn::format::dimension(l.format);
+        dims = convert_tensor(l.get_tensor(), rank, cldnn::format::is_grouped(l.format));
+        dnnl::memory::data_type dt = convert_data_type(l.data_type);
+        auto pitches = l.get_pitches();
+        dnnl::memory::dims strides(pitches.begin(), pitches.end());
+        dnnl::memory::desc res(dims, dt, strides);
+        return res;
+    }
+    
     if (target_fmt == dnnl::memory::format_tag::ab && flatten) {
         dims = flatten_tensor(l.get_tensor());
         dims.insert(dims.begin(), 1);
