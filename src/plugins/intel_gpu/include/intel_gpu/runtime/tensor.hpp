@@ -273,8 +273,10 @@ public:
                 continue;
 
             auto in_idx = in_order.find(channel);
-            if (in_idx == in_order.npos)
+            if (in_idx == in_order.npos) {
+                std::cerr << "Internal order of a format contains channel which does not appear in external order." << std::endl;
                 throw std::runtime_error("Internal order of a format contains channel which does not appear in external order.");
+            }
 
             _sizes[out_idx] = sizes[in_idx];
         }

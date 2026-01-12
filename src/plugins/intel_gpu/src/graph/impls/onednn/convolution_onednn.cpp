@@ -33,6 +33,10 @@ static std::shared_ptr<dnnl::convolution_forward::primitive_desc> get_convolutio
     auto output_layout = impl_params.get_output_layout();
     auto auto_pad = prim->auto_pad;
 
+    // // CVS-172561: Debug - check if weights_layout has custom format
+    // std::cerr << "[CVS-172561] get_convolution_primitive_descriptor: weights_layout.format = "
+    //               << weights_layout.format.to_string() << std::endl;
+
     // issue: it could not find the implementation for 1d kernel GroupConvolution from onednn.
     // root-cause: 3d tensor of input/output is changed to 4d via ngraph.
     //             Creating conv description returns error if two inputs have same tensor of data input and weight.
@@ -269,7 +273,12 @@ protected:
         auto traits = convert_memory_desc_to_traits(target_weights_desc, weights_format, grouped_weights);
 
         auto target_weights_layout = source_weights_layout;
-        target_weights_layout.format = format(traits);
+        // CVS-172561: For custom blocking formats from oneDNN, don't try to create a cldnn format
+        // from traits as it may have mismatched internal/external order causing errors.
+        // Instead, keep the source format and rely on target_weights_desc for actual reorder.
+        if (traits.str != "custom") {
+            target_weights_layout.format = format(traits);
+        }
 
         return std::make_shared<WeightsReorderParamsOneDNN>(source_weights_layout,
                                                             target_weights_layout,

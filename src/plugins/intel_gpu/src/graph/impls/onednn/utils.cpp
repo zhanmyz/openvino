@@ -347,6 +347,21 @@ public:
     }
 
     dnnl::memory::desc build() const {
+        // // CVS-172561: For custom blocking formats from oneDNN primitives,
+        // // we must use strides instead of format tags since custom formats cannot be
+        // // represented by standard oneDNN format tags.
+        // // This typically happens with depthwise GroupConvolution where oneDNN
+        // // returns custom blocking format when we use format_tag::any for weights.
+        bool is_custom_format = (_layout.format.to_string() == "custom");
+        if (is_custom_format) {
+            auto rank = cldnn::format::dimension(_layout.format);
+            auto dims = convert_tensor(_layout.get_tensor(), rank, cldnn::format::is_grouped(_layout.format));
+            auto dt = convert_data_type(_layout.data_type);
+            auto pitches = _layout.get_pitches();
+            dnnl::memory::dims strides(pitches.begin(), pitches.end());
+            return dnnl::memory::desc(dims, dt, strides);
+        }
+
         auto [dims, updated_fmt] = calculate_dims();
         auto dt = convert_data_type(_layout.data_type);
 
