@@ -426,7 +426,43 @@ private:
                 auto it = format_map_cldnn_4d_to_onednn_3d.find(_layout.format);
                 if (it != format_map_cldnn_4d_to_onednn_3d.end()) {
                     fmt_tag = it->second;
+                } else if (_layout.format == cldnn::format::custom) {
+                    // Handle custom format by mapping order to corresponding 3D format tag
+                    // This ensures generic handling for any custom format from oneDNN optimizations
+                    auto traits = _layout.format.traits();
+                    std::string order = traits.order;
+                    
+                    // Use the same mapping logic as format_map_cldnn_4d_to_onednn_3d
+                    // The order string determines the dimension arrangement
+                    if (order == "oiy" || order == "bfy") {
+                        // Standard order: dimension 0, 1, 2
+                        fmt_tag = dnnl::memory::format_tag::abc;
+                    } else if (order == "byf" || order == "oyf") {
+                        // Swapped last two: dimension 0, 2, 1
+                        fmt_tag = dnnl::memory::format_tag::acb;
+                    } else if (order == "ioy" || order == "fby") {
+                        // Swapped first two: dimension 1, 0, 2
+                        fmt_tag = dnnl::memory::format_tag::bac;
+                    } else if (order == "yio" || order == "yfb") {
+                        // Dimension 2, 1, 0
+                        fmt_tag = dnnl::memory::format_tag::cab;
+                    } else if (order == "yoi" || order == "ybf") {
+                        // Dimension 2, 0, 1
+                        fmt_tag = dnnl::memory::format_tag::cba;
+                    } else if (order == "iyo" || order == "fby") {
+                        // Dimension 1, 2, 0
+                        fmt_tag = dnnl::memory::format_tag::bca;
+                    } else {
+                        // Default to abc for unknown patterns
+                        fmt_tag = dnnl::memory::format_tag::abc;
+                    }
                 } else {
+                    std::cerr << "\n\n***** [ERROR POINT] *****" << std::endl;
+                    std::cerr << "This is where the error is thrown!" << std::endl;
+                    std::cerr << "Layout format: " << _layout.to_short_string() << std::endl;
+                    std::cerr << "Format string: " << _layout.format.to_string() << std::endl;
+                    std::cerr << "Reason: Format is 'custom' and not supported in 3D conversion" << std::endl;
+                    std::cerr << "*************************\n" << std::endl;
                     OPENVINO_THROW("[GPU] Unexpected layout format " + _layout.to_short_string());
                 }
             } else {

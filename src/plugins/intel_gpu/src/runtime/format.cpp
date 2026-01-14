@@ -205,9 +205,14 @@ format format::get_default_format(size_t rank, bool is_weights, bool is_grouped)
                 default_fmt = cldnn::format::goizyx;
             }
         } else {
-            if (rank == 4) {
+            // Non-grouped weights
+            if (rank == 3 || rank == 4) {
+                // rank=3: [O, I, X] - 1D spatial (root cause fix for CVS-177098)
+                // rank=4: [O, I, Y, X] - 2D spatial
+                // Both use oiyx (4D format), will be truncated to correct dimension
                 default_fmt = cldnn::format::oiyx;
             } else if (rank == 5) {
+                // [O, I, Z, Y, X] - 3D spatial
                 default_fmt = cldnn::format::oizyx;
             }
         }
