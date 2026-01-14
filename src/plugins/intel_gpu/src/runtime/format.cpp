@@ -199,15 +199,25 @@ format format::get_default_format(size_t rank, bool is_weights, bool is_grouped)
     auto default_fmt = cldnn::format::bfyx;
     if (is_weights) {
         if (is_grouped) {
-            if (rank == 5) {
+            // Grouped weights: rank = non-grouped rank + 1 (extra G dimension)
+            if (rank == 4 || rank == 5) {
+                // rank=4: [G, O, I, X] - 1D spatial convolution
+                // rank=5: [G, O, I, Y, X] - 2D spatial convolution
+                // Both use goiyx (5D format), will be truncated to correct dimension
                 default_fmt = cldnn::format::goiyx;
             } else if (rank == 6) {
+                // [G, O, I, Z, Y, X] - 3D spatial convolution
                 default_fmt = cldnn::format::goizyx;
             }
         } else {
-            if (rank == 4) {
+            // Non-grouped weights
+            if (rank == 3 || rank == 4) {
+                // rank=3: [O, I, X] - 1D spatial
+                // rank=4: [O, I, Y, X] - 2D spatial
+                // Both use oiyx (4D format), will be truncated to correct dimension
                 default_fmt = cldnn::format::oiyx;
             } else if (rank == 5) {
+                // [O, I, Z, Y, X] - 3D spatial
                 default_fmt = cldnn::format::oizyx;
             }
         }

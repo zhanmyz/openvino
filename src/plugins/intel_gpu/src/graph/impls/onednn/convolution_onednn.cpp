@@ -68,8 +68,8 @@ static std::shared_ptr<dnnl::convolution_forward::primitive_desc> get_convolutio
         op.set_strides(prim->stride);
         op.set_auto_pad(auto_pad);
         const auto spatial_rank = input_layout.get_spatial_rank();
-
         ov::PartialShape kernel;
+
         for (int32_t i = static_cast<int32_t>(spatial_rank) - 1; i >= 0; i--) {
             kernel.emplace_back(weights_layout.spatial(i));
         }
@@ -256,9 +256,45 @@ protected:
     static std::shared_ptr<WeightsReorderParams> get_weights_reorder(const kernel_impl_params& impl_params, const dnnl::primitive_desc& pd, bool rotate) {
         auto cldnn_prim = impl_params.typed_desc<convolution>();
 
+        // [DEBUG] Print layer information
+        std::cerr << "\n\n======== [LAYER DEBUG INFO] ========" << std::endl;
+        std::cerr << "Layer Name: " << impl_params.desc->id << std::endl;
+        std::cerr << "Layer Type: Convolution (oneDNN implementation)" << std::endl;
+        
         auto source_weights_layout = impl_params.get_input_layout(1);
         auto grouped_weights = format::is_grouped(source_weights_layout.format) || cldnn_prim->grouped_weights_shape;
+        
+        // [DEBUG] Print input layout information
+        std::cerr << "\n[INPUT LAYOUT (before transformation)]" << std::endl;
+        std::cerr << "  Input 0 (data):    " << impl_params.get_input_layout(0).to_short_string() << std::endl;
+        std::cerr << "  Input 1 (weights): " << source_weights_layout.to_short_string() << std::endl;
+        if (impl_params.input_layouts.size() > 2) {
+            std::cerr << "  Input 2 (bias):    " << impl_params.get_input_layout(2).to_short_string() << std::endl;
+        }
+        std::cerr << "  Output:            " << impl_params.get_output_layout().to_short_string() << std::endl;
+        std::cerr << "  Is grouped:        " << (grouped_weights ? "YES" : "NO") << std::endl;
+        
         auto target_weights_desc = pd.weights_desc(0);
+        
+        // [DEBUG] Print oneDNN optimized weights descriptor
+        std::cerr << "\n[ONEDNN OPTIMIZED WEIGHTS (after transformation)]" << std::endl;
+        std::cerr << "  ndims:        " << target_weights_desc.get_ndims() << std::endl;
+        std::cerr << "  dims:         [";
+        for (int i = 0; i < target_weights_desc.get_ndims(); i++) {
+            if (i > 0) std::cerr << ", ";
+            std::cerr << target_weights_desc.get_dims()[i];
+        }
+        std::cerr << "]" << std::endl;
+        std::cerr << "  strides:      [";
+        for (int i = 0; i < target_weights_desc.get_ndims(); i++) {
+            if (i > 0) std::cerr << ", ";
+            std::cerr << target_weights_desc.get_strides()[i];
+        }
+        std::cerr << "]" << std::endl;
+        std::cerr << "  inner_nblks:  " << target_weights_desc.get_inner_nblks() << std::endl;
+        std::cerr << "  **DIMENSION CHANGE**: " 
+                  << source_weights_layout.get_tensor().sizes().size() << "D -> " 
+                  << target_weights_desc.get_ndims() << "D" << std::endl;
 
         auto shape_consistent = onednn::keep_weights_reorder_shape_consistent(source_weights_layout, target_weights_desc);
         OPENVINO_ASSERT(shape_consistent, "[GPU] Input shape and output shape of weight reorder should be same.");
@@ -266,10 +302,23 @@ protected:
         auto source_weights_desc = onednn::layout_to_memory_desc(source_weights_layout, dnnl::memory::format_tag::undef);
 
         const bool weights_format = true;
+        
+        std::cerr << "\n[CONVERSION PROCESS]" << std::endl;
+        std::cerr << "Calling convert_memory_desc_to_traits()..." << std::endl;
+        
         auto traits = convert_memory_desc_to_traits(target_weights_desc, weights_format, grouped_weights);
+        
+        std::cerr << "\n[TRAITS RESULT]" << std::endl;
+        std::cerr << "  traits.str:   '" << traits.str << "'" << std::endl;
+        std::cerr << "  traits.order: '" << traits.order << "'" << std::endl;
+        std::cerr << "  **PROBLEM**: If traits.str='custom', this will cause error!" << std::endl;
 
         auto target_weights_layout = source_weights_layout;
         target_weights_layout.format = format(traits);
+        
+        std::cerr << "\n[FINAL FORMAT]" << std::endl;
+        std::cerr << "  Target format: " << target_weights_layout.format.to_string() << std::endl;
+        std::cerr << "======================================\n" << std::endl;
 
         return std::make_shared<WeightsReorderParamsOneDNN>(source_weights_layout,
                                                             target_weights_layout,

@@ -426,7 +426,37 @@ private:
                 auto it = format_map_cldnn_4d_to_onednn_3d.find(_layout.format);
                 if (it != format_map_cldnn_4d_to_onednn_3d.end()) {
                     fmt_tag = it->second;
+                } else if (_layout.format == cldnn::format::custom) {
+                    // Handle custom format: determine format based on traits.order
+                    // For 3D tensors, use generic abc-style tags consistent with format_map_cldnn_4d_to_onednn_3d
+                    auto traits = _layout.format.traits();
+                    std::string order = traits.order;
+                    
+                    // Map based on order string to match existing mappings in format_map_cldnn_4d_to_onednn_3d
+                    // Weights with order "oiy" should use abc (same as oiyx→abc)
+                    // Data with order "bfy" should use abc (same as bfyx→abc)
+                    // Data with order "byf" should use acb (same as byxf→acb)
+                    if (order == "oiy" || order == "bfy") {
+                        fmt_tag = dnnl::memory::format_tag::abc;
+                    } else if (order == "byf" || order == "bfx") {
+                        fmt_tag = dnnl::memory::format_tag::acb;
+                    } else if (order == "ioy") {
+                        fmt_tag = dnnl::memory::format_tag::bac;
+                    } else if (order == "yio") {
+                        fmt_tag = dnnl::memory::format_tag::cab;
+                    } else if (order == "fby" || order == "oyx") {
+                        fmt_tag = dnnl::memory::format_tag::bac;
+                    } else {
+                        // Default to abc for other cases
+                        fmt_tag = dnnl::memory::format_tag::abc;
+                    }
                 } else {
+                    std::cerr << "\n\n***** [ERROR POINT] *****" << std::endl;
+                    std::cerr << "This is where the error is thrown!" << std::endl;
+                    std::cerr << "Layout format: " << _layout.to_short_string() << std::endl;
+                    std::cerr << "Format string: " << _layout.format.to_string() << std::endl;
+                    std::cerr << "Reason: Format is 'custom' and not supported in 3D conversion" << std::endl;
+                    std::cerr << "*************************\n" << std::endl;
                     OPENVINO_THROW("[GPU] Unexpected layout format " + _layout.to_short_string());
                 }
             } else {
