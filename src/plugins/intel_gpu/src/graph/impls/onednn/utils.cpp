@@ -663,6 +663,28 @@ cldnn::format find_data_format(dnnl::memory::desc desc) {
 cldnn::format find_format(dnnl::memory::desc desc, bool is_grouped) {
     auto orders = get_candidate_orders(desc);
 
+    // Handle 3D plain weights format (e.g., depthwise GroupConvolution)
+    // oneDNN may return 3D tensor for weights when spatial dims are squeezed
+    // Map to appropriate 4D format by inferring the missing spatial dimension
+    if (desc.get_ndims() == 3 && desc.get_inner_nblks() == 0) {
+        std::cerr << "\n  [CVS-177098 find_format] **ROOT CAUSE DETECTED**: 3D plain weights format" << std::endl;
+        std::cerr << "  - This is the main issue: oneDNN returned 3D tensor instead of 4D" << std::endl;
+        std::cerr << "  - Dimensions: [" << desc.get_dims()[0] << ", " << desc.get_dims()[1] << ", " << desc.get_dims()[2] << "]" << std::endl;
+        std::cerr << "  - Strides: [" << desc.get_strides()[0] << ", " << desc.get_strides()[1] << ", " << desc.get_strides()[2] << "]" << std::endl;
+        std::cerr << "  - Grouped convolution: " << (is_grouped ? "YES" : "NO") << std::endl;
+        std::cerr << "  - Explanation: For depthwise convolution, oneDNN optimizes by returning 3D tensor" << std::endl;
+        std::cerr << "                 (e.g., [groups, 1, kernel] instead of [groups, 1, 1, kernel])" << std::endl;
+        
+        // For 3D weights without blocking, map to known 4D formats
+        // strides order [0,1,2] or [0,2,1] both represent oiy layout variants
+        if (compare_orders(orders, {{0, 1, 2}}) || compare_orders(orders, {{0, 2, 1}})) {
+            auto result = is_grouped ? format::goiyx : format::oiyx;
+            std::cerr << "  [FIX APPLIED] Mapping 3D->4D format: '" << format(result).to_string() << "'" << std::endl;
+            std::cerr << "  - This 4D format is compatible with cldnn's format system" << std::endl;
+            return result;
+        }
+    }
+
     format start_format = format::oiyx;
     if (is_grouped)
         start_format = format::goiyx;

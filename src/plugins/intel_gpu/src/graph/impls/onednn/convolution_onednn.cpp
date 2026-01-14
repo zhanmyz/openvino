@@ -266,10 +266,59 @@ protected:
         auto source_weights_desc = onednn::layout_to_memory_desc(source_weights_layout, dnnl::memory::format_tag::undef);
 
         const bool weights_format = true;
-        auto traits = convert_memory_desc_to_traits(target_weights_desc, weights_format, grouped_weights);
+        
+        // CVS-177098: Root Cause Analysis Debug Output
+        // Root cause: oneDNN returns 3D plain format for depthwise GroupConvolution
+        // which was not supported by find_format() and incorrectly handled by convert_memory_desc_to_traits()
+        std::cerr << "\n=== [CVS-177098] Root Cause Analysis: Weights Format Mapping ===" << std::endl;
+        std::cerr << "[INFO] oneDNN returned target_weights_desc with following properties:" << std::endl;
+        std::cerr << "  - Number of dimensions (ndims): " << target_weights_desc.get_ndims() << std::endl;
+        std::cerr << "  - Inner blocks (inner_nblks): " << target_weights_desc.get_inner_nblks() 
+                  << (target_weights_desc.get_inner_nblks() == 0 ? " (plain format, no blocking)" : " (blocked format)") << std::endl;
+        std::cerr << "  - Is grouped convolution: " << (grouped_weights ? "YES" : "NO") << std::endl;
+        std::cerr << "  - Dimensions: [";
+        for (int i = 0; i < target_weights_desc.get_ndims(); i++) {
+            if (i > 0) std::cerr << ", ";
+            std::cerr << target_weights_desc.get_dims()[i];
+        }
+        std::cerr << "]" << std::endl;
+        std::cerr << "  - Strides: [";
+        for (int i = 0; i < target_weights_desc.get_ndims(); i++) {
+            if (i > 0) std::cerr << ", ";
+            std::cerr << target_weights_desc.get_strides()[i];
+        }
+        std::cerr << "]" << std::endl;
+        std::cerr << "\n[STEP 1] Trying to find matching cldnn format using find_format()..." << std::endl;
+        
+        // CVS-177098: Try to find a matching cldnn format first (Reviewer's suggestion)
+        // This addresses the root cause: oneDNN may return 3D plain format for depthwise convolutions
+        // which needs to be properly mapped to 4D cldnn format
+        cldnn::format target_format = source_weights_layout.format;
+        try {
+            target_format = onednn::find_format(target_weights_desc, grouped_weights);
+            std::cerr << "[SUCCESS] find_format() successfully mapped to cldnn format: '" 
+                      << target_format.to_string() << "'" << std::endl;
+            std::cerr << "=== [CVS-177098] Format mapping completed successfully ===\n" << std::endl;
+        } catch (const std::exception& e) {
+            std::cerr << "[FAILED] find_format() threw exception: " << e.what() << std::endl;
+            std::cerr << "\n[STEP 2] Falling back to traits-based conversion..." << std::endl;
+            // Fallback to traits-based conversion if format lookup fails
+            auto traits = convert_memory_desc_to_traits(target_weights_desc, weights_format, grouped_weights);
+            std::cerr << "[INFO] Traits extracted: str='" << traits.str << "', order='" << traits.order << "'" << std::endl;
+            if (traits.str != "custom") {
+                target_format = format(traits);
+                std::cerr << "[SUCCESS] Using format from traits: '" << target_format.to_string() << "'" << std::endl;
+                std::cerr << "=== [CVS-177098] Format mapping completed via traits ===\n" << std::endl;
+            } else {
+                std::cerr << "[WARNING] Traits indicate 'custom' format - keeping source format '" 
+                          << source_weights_layout.format.to_string() << "'" << std::endl;
+                std::cerr << "=== [CVS-177098] Format mapping: kept source format ===\n" << std::endl;
+            }
+            // else: keep source format for true custom formats
+        }
 
         auto target_weights_layout = source_weights_layout;
-        target_weights_layout.format = format(traits);
+        target_weights_layout.format = target_format;
 
         return std::make_shared<WeightsReorderParamsOneDNN>(source_weights_layout,
                                                             target_weights_layout,
