@@ -419,16 +419,73 @@ private:
             // Converting 4D to 3D and updating format_tag within dims calculation breaks function atomicity.
             // This logic should be separated for better maintainability.
             if (shape_rank == 3 && !_keep_rank) {
+                std::cout << "\n!!!! [3D CONVERSION TRIGGERED] !!!!" << std::endl;
+                std::cout << "  Layout format: " << _layout.format.to_string() << std::endl;
+                std::cout << "  Layout shape:  " << _layout.to_short_string() << std::endl;
+                std::cout << "  _keep_rank:    " << _keep_rank << std::endl;
+                
                 dims.push_back(_layout.batch());
                 dims.push_back(_layout.feature());
                 dims.push_back(std::max(_layout.spatial(0), _layout.spatial(1)));
+                
                 // Since cldnn::format does not support 3D format, format_tag must be changed to be suitable for onednn.
+                // Handle custom format specially - use abc (most common order: b,f,yx or o,i,yx)
                 auto it = format_map_cldnn_4d_to_onednn_3d.find(_layout.format);
                 if (it != format_map_cldnn_4d_to_onednn_3d.end()) {
                     fmt_tag = it->second;
+                } else if (_layout.format == cldnn::format::custom) {
+                    //  std::cout << "  Custom format detected! Mapping to abc" << std::endl;
+                    //  fmt_tag = dnnl::memory::format_tag::abc;
+                    // Handle custom format by mapping order to corresponding 3D format tag
+                    // This ensures generic handling for any custom format from oneDNN optimizations
+                    auto traits = _layout.format.traits();
+                    std::string order = traits.order;
+                    
+                    // Use the same mapping logic as format_map_cldnn_4d_to_onednn_3d
+                    // The order string determines the dimension arrangement
+                    if (order == "oiy" || order == "bfy") {
+                        // Standard order: dimension 0, 1, 2
+                        fmt_tag = dnnl::memory::format_tag::abc;
+                    } else if (order == "byf" || order == "oyf") {
+                        // Swapped last two: dimension 0, 2, 1
+                        fmt_tag = dnnl::memory::format_tag::acb;
+                    } else if (order == "ioy" || order == "fby") {
+                        // Swapped first two: dimension 1, 0, 2
+                        fmt_tag = dnnl::memory::format_tag::bac;
+                    } else if (order == "yio" || order == "yfb") {
+                        // Dimension 2, 1, 0
+                        fmt_tag = dnnl::memory::format_tag::cab;
+                    } else if (order == "yoi" || order == "ybf") {
+                        // Dimension 2, 0, 1
+                        fmt_tag = dnnl::memory::format_tag::cba;
+                    } else if (order == "iyo" || order == "fby") {
+                        // Dimension 1, 2, 0
+                        fmt_tag = dnnl::memory::format_tag::bca;
+                    } else {
+                        // Default to abc for unknown patterns
+                        fmt_tag = dnnl::memory::format_tag::abc;
+                    }
                 } else {
+                    std::cout << "\n  ✗✗✗ ERROR POINT ✗✗✗" << std::endl;
+                    std::cout << "  Layout format '" << _layout.format.to_string() << "' not found in format_map_cldnn_4d_to_onednn_3d!" << std::endl;
                     OPENVINO_THROW("[GPU] Unexpected layout format " + _layout.to_short_string());
                 }
+                // if (_layout.format == cldnn::format::custom) {
+                //     std::cout << "  Custom format detected! Mapping to abc" << std::endl;
+                //     fmt_tag = dnnl::memory::format_tag::abc;
+                //     std::cout << "  ✓ Mapped custom to abc" << std::endl;
+                // } else {
+                //     // Non-custom format: look up in map
+                //     auto it = format_map_cldnn_4d_to_onednn_3d.find(_layout.format);
+                //     if (it != format_map_cldnn_4d_to_onednn_3d.end()) {
+                //         fmt_tag = it->second;
+                //         std::cout << "  ✓ Found mapping to format_tag" << std::endl;
+                //     } else {
+                //         std::cout << "\n  ✗✗✗ ERROR POINT ✗✗✗" << std::endl;
+                //         std::cout << "  Layout format '" << _layout.format.to_string() << "' not found in format_map_cldnn_4d_to_onednn_3d!" << std::endl;
+                //         OPENVINO_THROW("[GPU] Unexpected layout format " + _layout.to_short_string());
+                //     }
+                // }
             } else {
                 auto rank = cldnn::format::dimension(_layout.format);
                 dims = convert_tensor(_layout.get_tensor(), rank, cldnn::format::is_grouped(_layout.format));

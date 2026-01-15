@@ -24,13 +24,23 @@ namespace onednn {
 
 static std::shared_ptr<dnnl::convolution_forward::primitive_desc> get_convolution_primitive_descriptor(const kernel_impl_params& impl_params,
                                             const dnnl::primitive_attr& attr = dnnl::primitive_attr(),
-                                            dnnl::memory::format_tag tag_in_out = dnnl::memory::format_tag::undef) {
+                                            dnnl::memory::format_tag tag_in_out = dnnl::memory::format_tag::undef,
+                                            const char* caller = "UNKNOWN") {
     auto& engine = impl_params.prog->get_engine();
     auto prim = impl_params.typed_desc<convolution>();
+
+    std::cerr << "\n>>>>>> [get_convolution_primitive_descriptor] CALLED <<<<<<" << std::endl;
+    std::cerr << "  *** CALLER: " << caller << " ***" << std::endl;
+    std::cerr << "  Layer ID: " << impl_params.desc->id << std::endl;
 
     auto input_layout = impl_params.get_input_layout(0);
     auto weights_layout = impl_params.get_input_layout(1);
     auto output_layout = impl_params.get_output_layout();
+    
+    std::cerr << "  Input layout:   " << input_layout.to_short_string() << std::endl;
+    std::cerr << "  Weights layout: " << weights_layout.to_short_string() << std::endl;
+    std::cerr << "  Output layout:  " << output_layout.to_short_string() << std::endl;
+    
     auto auto_pad = prim->auto_pad;
 
     // issue: it could not find the implementation for 1d kernel GroupConvolution from onednn.
@@ -55,7 +65,16 @@ static std::shared_ptr<dnnl::convolution_forward::primitive_desc> get_convolutio
         weights_layout.format = format::get_default_format(weights_layout.get_rank() + 1, true, true);
     }
 
+    std::cerr << "\n  [BEFORE get_conv_memory_descs]" << std::endl;
+    std::cerr << "    Input layout:   " << input_layout.to_short_string() << std::endl;
+    std::cerr << "    Weights layout: " << weights_layout.to_short_string() << std::endl;
+    std::cerr << "    Output layout:  " << output_layout.to_short_string() << std::endl;
+    std::cerr << "    Calling get_conv_memory_descs()..." << std::endl;
+
     auto [input_md, weights_md, output_md] = onednn::get_conv_memory_descs(input_layout, weights_layout, output_layout, tag_in_out);
+    
+    std::cerr << "    ✓ get_conv_memory_descs() SUCCESS" << std::endl;
+    std::cerr << ">>>>>> [get_convolution_primitive_descriptor] END <<<<<<\n" << std::endl;
 
     dnnl::memory::dims stride(prim->stride.begin(), prim->stride.end());
     dnnl::memory::dims dilation(prim->dilation.begin(), prim->dilation.end());
@@ -68,8 +87,8 @@ static std::shared_ptr<dnnl::convolution_forward::primitive_desc> get_convolutio
         op.set_strides(prim->stride);
         op.set_auto_pad(auto_pad);
         const auto spatial_rank = input_layout.get_spatial_rank();
-
         ov::PartialShape kernel;
+
         for (int32_t i = static_cast<int32_t>(spatial_rank) - 1; i >= 0; i--) {
             kernel.emplace_back(weights_layout.spatial(i));
         }
@@ -256,9 +275,45 @@ protected:
     static std::shared_ptr<WeightsReorderParams> get_weights_reorder(const kernel_impl_params& impl_params, const dnnl::primitive_desc& pd, bool rotate) {
         auto cldnn_prim = impl_params.typed_desc<convolution>();
 
+        // [DEBUG] Print layer information
+        std::cerr << "\n\n======== [LAYER DEBUG INFO] ========" << std::endl;
+        std::cerr << "Layer Name: " << impl_params.desc->id << std::endl;
+        std::cerr << "Layer Type: Convolution (oneDNN implementation)" << std::endl;
+        
         auto source_weights_layout = impl_params.get_input_layout(1);
         auto grouped_weights = format::is_grouped(source_weights_layout.format) || cldnn_prim->grouped_weights_shape;
+        
+        // [DEBUG] Print input layout information
+        std::cerr << "\n[INPUT LAYOUT (before transformation)]" << std::endl;
+        std::cerr << "  Input 0 (data):    " << impl_params.get_input_layout(0).to_short_string() << std::endl;
+        std::cerr << "  Input 1 (weights): " << source_weights_layout.to_short_string() << std::endl;
+        if (impl_params.input_layouts.size() > 2) {
+            std::cerr << "  Input 2 (bias):    " << impl_params.get_input_layout(2).to_short_string() << std::endl;
+        }
+        std::cerr << "  Output:            " << impl_params.get_output_layout().to_short_string() << std::endl;
+        std::cerr << "  Is grouped:        " << (grouped_weights ? "YES" : "NO") << std::endl;
+        
         auto target_weights_desc = pd.weights_desc(0);
+        
+        // [DEBUG] Print oneDNN optimized weights descriptor
+        std::cerr << "\n[ONEDNN OPTIMIZED WEIGHTS (after transformation)]" << std::endl;
+        std::cerr << "  ndims:        " << target_weights_desc.get_ndims() << std::endl;
+        std::cerr << "  dims:         [";
+        for (int i = 0; i < target_weights_desc.get_ndims(); i++) {
+            if (i > 0) std::cerr << ", ";
+            std::cerr << target_weights_desc.get_dims()[i];
+        }
+        std::cerr << "]" << std::endl;
+        std::cerr << "  strides:      [";
+        for (int i = 0; i < target_weights_desc.get_ndims(); i++) {
+            if (i > 0) std::cerr << ", ";
+            std::cerr << target_weights_desc.get_strides()[i];
+        }
+        std::cerr << "]" << std::endl;
+        std::cerr << "  inner_nblks:  " << target_weights_desc.get_inner_nblks() << std::endl;
+        std::cerr << "  **DIMENSION CHANGE**: " 
+                  << source_weights_layout.get_tensor().sizes().size() << "D -> " 
+                  << target_weights_desc.get_ndims() << "D" << std::endl;
 
         auto shape_consistent = onednn::keep_weights_reorder_shape_consistent(source_weights_layout, target_weights_desc);
         OPENVINO_ASSERT(shape_consistent, "[GPU] Input shape and output shape of weight reorder should be same.");
@@ -266,10 +321,23 @@ protected:
         auto source_weights_desc = onednn::layout_to_memory_desc(source_weights_layout, dnnl::memory::format_tag::undef);
 
         const bool weights_format = true;
+        
+        std::cerr << "\n[CONVERSION PROCESS]" << std::endl;
+        std::cerr << "Calling convert_memory_desc_to_traits()..." << std::endl;
+        
         auto traits = convert_memory_desc_to_traits(target_weights_desc, weights_format, grouped_weights);
+        
+        std::cerr << "\n[TRAITS RESULT]" << std::endl;
+        std::cerr << "  traits.str:   '" << traits.str << "'" << std::endl;
+        std::cerr << "  traits.order: '" << traits.order << "'" << std::endl;
+        std::cerr << "  **PROBLEM**: If traits.str='custom', this will cause error!" << std::endl;
 
         auto target_weights_layout = source_weights_layout;
         target_weights_layout.format = format(traits);
+        
+        std::cerr << "\n[FINAL FORMAT]" << std::endl;
+        std::cerr << "  Target format: " << target_weights_layout.format.to_string() << std::endl;
+        std::cerr << "======================================\n" << std::endl;
 
         return std::make_shared<WeightsReorderParamsOneDNN>(source_weights_layout,
                                                             target_weights_layout,
@@ -377,16 +445,29 @@ public:
         int zero_point_mask = -1;
         dnnl::memory::data_type wzp_data_type = dnnl::memory::data_type::undef;
 
+        std::cerr << "\n╔════════════════════════════════════════════════════════════╗" << std::endl;
+        std::cerr << "║  [CREATE] Starting create() for: " << impl_params.desc->id << std::endl;
+        std::cerr << "║  Initial weights layout: " << impl_params.get_input_layout(1).to_short_string() << std::endl;
+        std::cerr << "╚════════════════════════════════════════════════════════════╝" << std::endl;
+
         auto attr = get_primitive_attributes(arg, impl_params, zero_point_mask, wzp_data_type);
 
-        auto prim_desc = get_convolution_primitive_descriptor(impl_params, *attr);
+        std::cerr << "\n[CREATE] Step 1: Calling get_convolution_primitive_descriptor..." << std::endl;
+        auto prim_desc = get_convolution_primitive_descriptor(impl_params, *attr, dnnl::memory::format_tag::undef, "create_impl");
+        std::cerr << "[CREATE] Step 1 completed. Weights layout still: " << impl_params.get_input_layout(1).to_short_string() << std::endl;
 
-        auto conv_onednn_impl = std::make_unique<convolution_onednn>(engine, config, attr, *prim_desc,
-                                                get_weights_reorder(impl_params, *prim_desc, arg.get_transposed()));
+        std::cerr << "\n[CREATE] Step 2: Calling get_weights_reorder..." << std::endl;
+        auto weights_reorder = get_weights_reorder(impl_params, *prim_desc, arg.get_transposed());
+        std::cerr << "[CREATE] Step 2 completed. Weights layout now: " << impl_params.get_input_layout(1).to_short_string() << std::endl;
+
+        std::cerr << "\n[CREATE] Step 3: Creating convolution_onednn object..." << std::endl;
+        auto conv_onednn_impl = std::make_unique<convolution_onednn>(engine, config, attr, *prim_desc, weights_reorder);
+        std::cerr << "[CREATE] Step 3 completed." << std::endl;
 
         conv_onednn_impl->set_zero_point_mask(zero_point_mask);
         conv_onednn_impl->set_weights_zero_point_data_type(wzp_data_type);
 
+        std::cerr << "[CREATE] Finished create() successfully.\n" << std::endl;
         return conv_onednn_impl;
     }
 };
@@ -403,7 +484,7 @@ in_out_fmts_t ConvolutionImplementationManager::query_formats(const program_node
 
     const auto& conv_node = node.as<convolution>();
 
-    auto prim_desc = get_convolution_primitive_descriptor(*node.get_kernel_impl_params(), dnnl::primitive_attr(), dnnl::memory::format_tag::any);
+    auto prim_desc = get_convolution_primitive_descriptor(*node.get_kernel_impl_params(), dnnl::primitive_attr(), dnnl::memory::format_tag::any, "query_formats");
 
     for (size_t idx = 0 ; idx < node.get_dependencies().size() ; idx++) {
         if (node.get_dependency(idx).is_constant())
