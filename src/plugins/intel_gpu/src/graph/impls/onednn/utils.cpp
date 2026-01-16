@@ -431,6 +431,18 @@ private:
                 auto it = format_map_cldnn_4d_to_onednn_3d.find(_layout.format);
                 if (it != format_map_cldnn_4d_to_onednn_3d.end()) {
                     fmt_tag = it->second;
+                } else if (_layout.format == cldnn::format::custom) {
+                    // Fix for CVS-177098: Handle custom format for 3D weights
+                    // In OpenVoice model, Conv_42/47/52 share weights [192,1,1]. During optimization,
+                    // oneDNN creates a custom format (order="oiy") for shared weights. We match this
+                    // order string against format_map entries to find the corresponding format_tag.
+                    auto custom_order = _layout.format.traits().order;
+                    for (const auto& [fmt, tag] : format_map_cldnn_4d_to_onednn_3d) {
+                        if (cldnn::format::traits(fmt).order.substr(0, 3) == custom_order) {
+                            fmt_tag = tag;
+                            break;
+                        }
+                    }
                 } else {
                     OPENVINO_THROW("[GPU] Unexpected layout format " + _layout.to_short_string());
                 }

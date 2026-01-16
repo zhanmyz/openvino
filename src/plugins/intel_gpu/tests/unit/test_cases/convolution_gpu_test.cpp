@@ -27,6 +27,7 @@
 #include <tuple>
 
 #include "convolution_inst.h"
+#include "graph/impls/onednn/utils.hpp"
 
 using namespace cldnn;
 using namespace ::tests;
@@ -9469,6 +9470,78 @@ INSTANTIATE_TEST_SUITE_P(
 class convolution_random_mmad_test : public testing::TestWithParam<convolution_random_test_all_params> {};
 using convolution_random_test_mmad_u8u8f32 = convolution_random_test_base<uint8_t, uint8_t, float>;
 using convolution_random_test_mmad_s8u8f32 = convolution_random_test_base<int8_t, uint8_t, float>;
+
+// CVS-177098: Test for custom format with 3D layout
+// This test reproduces the exact error: "[GPU] Unexpected layout format f16:custom:192x1x1:nopad"
+// The error occurs when calculate_dims() encounters a custom format with shape_rank==3
+TEST(convolution_gpu, cvs_177098_custom_format_3d_weights) {
+    auto& engine = get_test_engine();
+
+    // Skip test if oneDNN is not available  
+    if (!engine.get_device_info().supports_immad)
+        return;
+
+    // Create a custom format layout mimicking what oneDNN creates for shared 3D weights
+    // Dimensions: [192, 1, 1] - same as OpenVoice model weights
+    ov::PartialShape weights_shape{192, 1, 1};
+    
+    // Create custom format traits with order="oiy" (3D)
+    // This is exactly what oneDNN creates for shared weights in OpenVoice model
+    format_traits custom_traits;
+    custom_traits.str = "custom";
+    custom_traits.order = "oiy";  // 3-character order for 3D tensor
+    custom_traits.internal_order = "oixyz";
+    custom_traits.batch_num = 0;
+    custom_traits.feature_num = 1;
+    custom_traits.spatial_num = 1;
+    custom_traits.group_num = 0;
+    custom_traits._order = {0, 1, 2};  // o, i, y ordering
+    custom_traits.block_sizes = {};    // No blocking
+    custom_traits.logic_block_sizes = {};
+    
+    // Create a custom format with these traits
+    cldnn::format custom_fmt(format::custom);
+    custom_fmt.custom_traits = custom_traits;
+    
+    // Create layout with custom format
+    layout custom_layout(weights_shape, data_types::f16, custom_fmt);
+    
+    // This is the critical test: layout_to_memory_desc() is called during weights reorder
+    // When shape_rank==3 and format is custom, calculate_dims() should handle it
+    // WITHOUT the fix, this throws: "[GPU] Unexpected layout format f16:custom:192x1x1:nopad"
+    // WITH the fix, it matches "oiy" to "oiyx".substr(0,3) and succeeds
+    
+    // The actual code path that triggers the error in OpenVoice:
+    // 1. Conv primitive gets weights with custom format from oneDNN optimization
+    // 2. get_weights_reorder() calls layout_to_memory_desc(source_weights_layout)
+    // 3. layout_to_memory_desc() calls MemoryDescriptorBuilder::calculate_dims()
+    // 4. calculate_dims() encounters shape_rank==3 with custom format
+    // 5. Without fix: throws "[GPU] Unexpected layout format"
+    // 6. With fix: matches custom order "oiy" and returns correct format_tag
+    
+    try {
+        // This should throw without the fix in utils.cpp
+        auto md = onednn::layout_to_memory_desc(custom_layout, dnnl::memory::format_tag::undef);
+        
+        // If we get here, the fix is working
+        SUCCEED() << "Successfully handled custom format with 3D layout";
+        
+    } catch (const std::exception& e) {
+        std::string error_msg(e.what());
+        
+        // Expect the specific error message
+        if (error_msg.find("Unexpected layout format") != std::string::npos &&
+            error_msg.find("custom") != std::string::npos) {
+            // This is the exact error we're testing for!
+            FAIL() << "REPRODUCED CVS-177098 ERROR: " << error_msg 
+                   << "\n\nThis confirms the bug exists. "
+                   << "The fix in utils.cpp::calculate_dims() should handle custom format.";
+        } else {
+            // Some other error
+            FAIL() << "Unexpected error: " << error_msg;
+        }
+    }
+}
 
 TEST_P(convolution_random_mmad_test, s8u8f32) {
     convolution_random_test_mmad_s8u8f32 test;
