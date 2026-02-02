@@ -355,15 +355,17 @@ static bool can_reshape_be_optimized(const reshape_node& node) {
     if (node.has_fused_primitives())
         return false;
 
+    // CRITICAL: Check is_in_place() FIRST before any other optimizations
+    // If shapes differ, we cannot use reinterpret_buffer regardless of other conditions
+    if (!node.is_in_place())
+        return false;
+
     // Onednn supports padded input of outer axis
     if (!node.is_dynamic() && node.has_outer_padding_offset() &&
         node.get_users().front()->get_preferred_impl_type() == impl_types::onednn)
         return true;
 
-    if (node.is_in_place())
-        return true;
-
-    return false;
+    return true;
 }
 
 static bool is_optimizable_padding_for_crop(const crop_node& node,

@@ -465,9 +465,13 @@ bool layout::compatible(const layout& other) const {
     if (l1.data_type != l2.data_type)
         return false;
     // Reorders between bfyx, bfzyx, bfwzyx can be reinterpeted as reshape when
-    // there is no padding and both hold same number of elements.
+    // there is no padding and both hold same number of elements and same shape.
+    // However, if the shapes are different (even with same total count), the memory layout
+    // is different and requires actual data reorganization, not just reinterpretation.
     if (format::is_default_format(l1.format) && format::is_default_format(l2.format) &&
-        !l1.data_padding && !l2.data_padding && l1.get_linear_size() == l2.get_linear_size())
+        !l1.data_padding && !l2.data_padding && 
+        l1.get_linear_size() == l2.get_linear_size() &&
+        l1.get_shape() == l2.get_shape())
         return true;
     if (l1.get_shape() != l2.get_shape())
         return false;

@@ -126,11 +126,33 @@ public:
         if (this->is_output() || this->has_fused_primitives())
             return false;
 
-        if (input().get_output_layout(false).data_padding.is_dynamic() && is_runtime_propagatable_padding())
+        auto input_layout = input().get_output_layout(false);
+        auto output_layout = this->get_output_layout();
+
+        if (input_layout.data_padding.is_dynamic() && is_runtime_propagatable_padding())
             return true;
 
-        if (has_padding())
+        // Check for any padding on input or output
+        bool has_input_padding = static_cast<bool>(input_layout.data_padding);
+        bool has_output_padding = has_padding();
+
+        if (has_output_padding || has_input_padding) {
             return false;
+        }
+
+        // Check if input and output shapes are compatible for in-place operation
+        // In-place reshape (reinterpret_buffer) only works when the shapes are identical
+        // or when only the format changes without data reorganization.
+        // For example, [b:2,f:24,x:1,y:1] -> [b:2,f:6,x:4,y:1] requires actual data copy
+        // because the memory layout is different even though total count is same.
+        
+        // Skip shape check for dynamic shapes
+        if (!input_layout.is_static() || !output_layout.is_static())
+            return true;
+
+        if (input_layout.get_shape() != output_layout.get_shape()) {
+            return false;
+        }
 
         return true;
     }
