@@ -126,13 +126,65 @@ public:
         if (this->is_output() || this->has_fused_primitives())
             return false;
 
-        if (input().get_output_layout(false).data_padding.is_dynamic() && is_runtime_propagatable_padding())
+        auto input_layout = input().get_output_layout(false);
+        auto output_layout = this->get_output_layout();
+
+        if (input_layout.data_padding.is_dynamic() && is_runtime_propagatable_padding())
             return true;
 
-        if (has_padding())
-            return false;
+        // Check for any padding on input or output
+        bool has_input_padding = static_cast<bool>(input_layout.data_padding);
+        bool has_output_padding = has_padding();
 
-        return true;
+        if (has_output_padding || has_input_padding) {
+            return false;
+        }
+
+        // For static shapes, check if reshape changes the structure in a way that requires data copy.
+        // layout::compatible() allows default format reshapes with same total size,
+        // but some reshapes like [2,24,1,1]->[2,6,1,4] require actual data reorganization
+        // even though the total count is the same.
+        //
+        // Key insight: If the input has all spatial dims as 1 (e.g., [b,f,1,1]),
+        // and the output has spatial dims > 1 (e.g., [b,f',1,x] where x>1),
+        // AND the feature dimension changes (f != f'), then we're redistributing
+        // feature data into spatial dimensions, which requires data copy.
+        if (!input_layout.is_static() || !output_layout.is_static())
+            return true;
+
+        auto in_shape = input_layout.get_shape();
+        auto out_shape = output_layout.get_shape();
+
+        // bfyx format: shape is [batch, feature, spatial...]
+        // Check if input is "flat" (all spatial dims = 1) and output expands spatial dims
+        bool input_is_flat = true;
+        for (size_t i = 2; i < in_shape.size(); ++i) {
+            if (in_shape[i] != 1) {
+                input_is_flat = false;
+                break;
+            }
+        }
+
+        if (input_is_flat) {
+            // Input is flat like [b,f,1,1...]. Check if output expands spatial and changes feature.
+            bool output_has_spatial = false;
+            for (size_t i = 2; i < out_shape.size(); ++i) {
+                if (out_shape[i] > 1) {
+                    output_has_spatial = true;
+                    break;
+                }
+            }
+
+            if (output_has_spatial && in_shape[1] != out_shape[1]) {
+                // Reshaping [b,f,1,1...] -> [b,f',s,s'...] where f != f' and s > 1
+                // This redistributes feature data into spatial dims, requires data copy.
+                // Example: [2,24,1,1] -> [2,6,1,4] needs to reorganize data.
+                return false;
+            }
+        }
+
+        // Use layout::compatible() for other cases (it allows same-size default format reshapes)
+        return input_layout.compatible(output_layout);
     }
 
     void adjust_output_padding() {
