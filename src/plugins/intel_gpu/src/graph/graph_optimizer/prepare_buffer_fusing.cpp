@@ -357,8 +357,10 @@ static bool can_reshape_be_optimized(const reshape_node& node) {
 
     // Onednn supports padded input of outer axis
     if (!node.is_dynamic() && node.has_outer_padding_offset() &&
-        node.get_users().front()->get_preferred_impl_type() == impl_types::onednn)
-        return true;
+        node.get_users().front()->get_preferred_impl_type() == impl_types::onednn) {
+            std::cerr << "DEBUG can_reshape_be_optimized: " << node.id() << " returns true (onednn)" << std::endl;
+            return true;
+        }
 
     if (node.is_in_place())
         return true;

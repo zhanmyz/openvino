@@ -92,9 +92,24 @@ public:
     }
 
     bool has_padding() const {
-        return (this->get_output_layout().data_padding
+        bool result = (this->get_output_layout().data_padding
                 || input().get_output_layout(false).data_padding
                 || input().get_output_layout(false).data_padding.is_dynamic());
+        if (this->id().find("BoxPredictor") != std::string::npos) {
+            auto input_pad = input().get_output_layout(false).data_padding;
+            std::cerr << "DEBUG has_padding " << this->id() << " result=" << result;
+            if (result) {
+                std::cerr << " lower=[" << input_pad._lower_size[0] << "," << input_pad._lower_size[1] 
+                          << "," << input_pad._lower_size[2] << "," << input_pad._lower_size[3] << "]"
+                          << " upper=[" << input_pad._upper_size[0] << "," << input_pad._upper_size[1] 
+                          << "," << input_pad._upper_size[2] << "," << input_pad._upper_size[3] << "]";
+            }
+            std::cerr << std::endl;
+        }
+        return result;
+        // return (this->get_output_layout().data_padding
+        //         || input().get_output_layout(false).data_padding
+        //         || input().get_output_layout(false).data_padding.is_dynamic());
     }
 
     bool has_outer_padding_offset() const {
@@ -103,6 +118,19 @@ public:
 
         auto input_layout = input().get_output_layout(false);
         auto input_pad = input_layout.data_padding;
+        // Debug: check padding details
+        if (this->id().find("BoxPredictor") != std::string::npos) {
+            std::cerr << "DEBUG " << this->id() << " has_outer_padding_offset checking:" << std::endl;
+            std::cerr << "  input shape: [" << input_layout.batch() << "," << input_layout.feature() 
+                      << "," << input_layout.spatial(0) << "," << input_layout.spatial(1) << "]" << std::endl;
+            std::cerr << "  output shape: [" << this->get_output_layout().batch() << "," << this->get_output_layout().feature()
+                      << "," << this->get_output_layout().spatial(0) << "," << this->get_output_layout().spatial(1) << "]" << std::endl;
+            std::cerr << "  lower_pad: [" << input_pad._lower_size[0] << "," << input_pad._lower_size[1] 
+                      << "," << input_pad._lower_size[2] << "," << input_pad._lower_size[3] << "]" << std::endl;
+            std::cerr << "  upper_pad: [" << input_pad._upper_size[0] << "," << input_pad._upper_size[1] 
+                      << "," << input_pad._upper_size[2] << "," << input_pad._upper_size[3] << "]" << std::endl;
+        }
+
         for (size_t i = 0 ; i < input_layout.get_spatial_rank() ; i++) {
             if (input_pad._lower_size[2 + i] != 0)
                 return false;
@@ -111,8 +139,10 @@ public:
         }
 
         // Expected a padded input of only batch axis with 'bxxx' format
+        // If feature dimension has padding, return false because OneDNN cannot handle it with reshape
         if (input_layout.format.dims_order()[0] != 0 ||
-            input_pad._lower_size[1] != 0)
+            input_pad._lower_size[1] != 0 ||
+            input_pad._upper_size[1] != 0)  // Feature padding breaks reshape optimization
             return false;
 
         if (format::is_multi_blocked(input_layout.format))
