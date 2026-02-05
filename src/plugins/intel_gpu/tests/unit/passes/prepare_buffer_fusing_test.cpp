@@ -1729,3 +1729,59 @@ TEST(prepare_buffer_fusing, reorder_permute_with_fused_prim) {
     ASSERT_FALSE(reorder_node.can_be_optimized());
     ASSERT_FALSE(permute_node.can_be_optimized());
 }
+
+// Test for CVS-175476: Reshape with feature dimension upper padding should not be optimized
+// This test verifies that has_outer_padding_offset() correctly rejects inputs with feature upper padding
+// Original issue occurred with FP16 data type
+TEST(prepare_buffer_fusing, disable_reshape_with_feature_upper_padding) {
+    auto& engine = get_test_engine();
+
+    // Use FP16 data type to match the original BoxPredictor_5/Reshape scenario
+    auto in_layout = layout{ov::PartialShape{2, 24, 1, 1}, data_types::f16, format::bfyx};
+
+    topology topology;
+    topology.add(input_layout("input", in_layout));
+    topology.add(activation("act", input_info("input"), activation_func::relu));
+    topology.add(reshape("reshape", input_info("act"), false, {2, 6, 1, 4}, 
+                         ov::PartialShape{2, 6, 1, 4}));
+    topology.add(reorder("output", input_info("reshape"), format::bfyx, data_types::f16));
+
+    ExecutionConfig config = get_test_default_config(engine);
+    config.set_property(ov::intel_gpu::optimize_data(true));
+    auto prog = program::build_program(engine, topology, config, false, false);
+    ASSERT_NE(prog, nullptr);
+    ASSERT_TRUE(prog->has_node("reshape"));
+    ASSERT_TRUE(prog->has_node("act"));
+
+    // Manually set feature upper padding on the activation node output
+    // This simulates the BoxPredictor_5/Reshape scenario with upper_pad=[0,8,0,0]
+    auto& act_node = prog->get_node("act");
+    auto act_layout = act_node.get_output_layout();
+    padding feature_upper_padding({0, 0, 0, 0}, {0, 8, 0, 0});  // upper_size[1] = 8
+    act_layout.data_padding = feature_upper_padding;
+    act_node.set_output_layout(act_layout, false);
+
+    auto& reshape_node = prog->get_node("reshape").as<reshape>();
+
+    // Verify that reshape's input (act node) has feature upper padding
+    auto& reshape_input_layout = reshape_node.get_dependency(0).get_output_layout();
+    ASSERT_GT(reshape_input_layout.data_padding._upper_size[1], 0)
+        << "Test setup: reshape input should have feature upper padding";
+
+    // Directly test has_outer_padding_offset() with the padded input
+    // This is the key function our fix modifies
+    bool has_outer_pad = reshape_node.has_outer_padding_offset();
+
+    // Verify the fix: has_outer_padding_offset() should return FALSE
+    // when input has feature upper padding (because it's not safe for optimization)
+    ASSERT_FALSE(has_outer_pad)
+        << "has_outer_padding_offset() should return FALSE for inputs with feature upper padding";
+
+    // Apply prepare_buffer_fusing pass to update can_be_optimized() status
+    program_wrapper::apply_opt_pass<prepare_buffer_fusing>(*prog);
+
+    // Verify that reshape cannot be optimized when input has feature upper padding
+    ASSERT_FALSE(reshape_node.can_be_optimized())
+        << "Reshape with feature upper padding should NOT be optimized";
+}
+
