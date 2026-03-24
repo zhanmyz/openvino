@@ -5,6 +5,7 @@
 #include "intel_gpu/op/indirect_sdpa.hpp"
 #include "intel_gpu/op/kv_cache.hpp"
 #include "intel_gpu/op/sdpa.hpp"
+#include <iostream>
 #include "intel_gpu/plugin/remote_context.hpp"
 #include "intel_gpu/primitives/paged_attention.hpp"
 #include "intel_gpu/runtime/execution_config.hpp"
@@ -269,7 +270,14 @@ void ExecutionConfig::finalize_impl(const IRemoteContext* context) {
     }
 
     const auto& info = dynamic_cast<const RemoteContextImpl*>(context)->get_engine().get_device_info();
+    std::cerr << "[CVS-182776 DEBUG] finalize_impl: BEFORE apply_hints" << std::endl;
+    std::cerr << "[CVS-182776 DEBUG]   inference_precision = " << get_inference_precision().get_type_name() << std::endl;
+    std::cerr << "[CVS-182776 DEBUG]   execution_mode = " << static_cast<int>(get_execution_mode()) << std::endl;
+    std::cerr << "[CVS-182776 DEBUG]   is_set_by_user(inference_precision) = " << is_set_by_user(ov::hint::inference_precision) << std::endl;
+    std::cerr << "[CVS-182776 DEBUG]   is_set_by_user(execution_mode) = " << is_set_by_user(ov::hint::execution_mode) << std::endl;
     apply_hints(info);
+    std::cerr << "[CVS-182776 DEBUG] finalize_impl: AFTER apply_hints" << std::endl;
+    std::cerr << "[CVS-182776 DEBUG]   inference_precision = " << get_inference_precision().get_type_name() << std::endl;
     if (!is_set_by_user(ov::internal::enable_lp_transformations)) {
         m_enable_lp_transformations = info.supports_imad || info.supports_immad;
     }
@@ -311,18 +319,32 @@ void ExecutionConfig::apply_hints(const cldnn::device_info& info) {
 }
 
 void ExecutionConfig::apply_execution_hints(const cldnn::device_info& info) {
+    std::cerr << "[CVS-182776 DEBUG] apply_execution_hints:" << std::endl;
+    std::cerr << "[CVS-182776 DEBUG]   is_set_by_user(execution_mode) = " << is_set_by_user(ov::hint::execution_mode) << std::endl;
+    std::cerr << "[CVS-182776 DEBUG]   is_set_by_user(inference_precision) = " << is_set_by_user(ov::hint::inference_precision) << std::endl;
+    std::cerr << "[CVS-182776 DEBUG]   current inference_precision = " << get_inference_precision().get_type_name() << std::endl;
+    std::cerr << "[CVS-182776 DEBUG]   info.supports_fp16 = " << info.supports_fp16 << std::endl;
     if (is_set_by_user(ov::hint::execution_mode)) {
         const auto mode = get_execution_mode();
+        std::cerr << "[CVS-182776 DEBUG]   execution_mode = " << static_cast<int>(mode) << " (0=PERFORMANCE, 1=ACCURACY)" << std::endl;
         if (!is_set_by_user(ov::hint::inference_precision)) {
             if (mode == ov::hint::ExecutionMode::ACCURACY) {
                 m_inference_precision = ov::element::dynamic;
+                std::cerr << "[CVS-182776 DEBUG]   => set inference_precision to dynamic (ACCURACY mode)" << std::endl;
             } else if (mode == ov::hint::ExecutionMode::PERFORMANCE) {
-                if (info.supports_fp16)
+                if (info.supports_fp16) {
                     m_inference_precision = ov::element::f16;
-                else
+                    std::cerr << "[CVS-182776 DEBUG]   => set inference_precision to f16 (PERFORMANCE + supports_fp16)" << std::endl;
+                } else {
                     m_inference_precision = ov::element::f32;
+                    std::cerr << "[CVS-182776 DEBUG]   => set inference_precision to f32 (PERFORMANCE + no fp16)" << std::endl;
+                }
             }
+        } else {
+            std::cerr << "[CVS-182776 DEBUG]   => inference_precision already set by user, no change" << std::endl;
         }
+    } else {
+        std::cerr << "[CVS-182776 DEBUG]   => execution_mode NOT set by user, keeping default inference_precision = " << get_inference_precision().get_type_name() << std::endl;
     }
 }
 

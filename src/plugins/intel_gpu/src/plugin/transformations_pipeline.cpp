@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <iostream>
 #include <limits>
 #include <map>
 #include <memory>
@@ -399,7 +400,9 @@ void TransformationsPipeline::apply(std::shared_ptr<ov::Model> func) {
     };
     const auto fallback_precision = ov::element::f32;
     auto infer_precision = config.get_inference_precision();
+    std::cerr << "[CVS-182776 DEBUG] transformations_pipeline: infer_precision = " << infer_precision.get_type_name() << std::endl;
     if (infer_precision != ov::element::dynamic && !fp_precision_supported(infer_precision)) {
+        std::cerr << "[CVS-182776 DEBUG]   infer_precision not supported, falling back to f32" << std::endl;
         infer_precision = fallback_precision;
     }
     {
@@ -511,6 +514,7 @@ void TransformationsPipeline::apply(std::shared_ptr<ov::Model> func) {
             for (auto& et : fp_element_types) {
                 if (et != infer_precision) {
                     fp_convert_precision_map.insert({et, infer_precision});
+                    std::cerr << "[CVS-182776 DEBUG]   precision conversion: " << et.get_type_name() << " -> " << infer_precision.get_type_name() << std::endl;
                 }
             }
         }
@@ -582,6 +586,7 @@ void TransformationsPipeline::apply(std::shared_ptr<ov::Model> func) {
                                                           keep_precision_sensitive_in_fp32_1,
                                                           convert_input_output_precision,
                                                           store_original_precision_as_rt_attribute);
+        std::cerr << "[CVS-182776 DEBUG]   ConvertPrecision registered with keep_precision_sensitive=" << keep_precision_sensitive_in_fp32_1 << std::endl;
 
         manager.register_pass<ov::pass::CommonOptimizations>();
 
