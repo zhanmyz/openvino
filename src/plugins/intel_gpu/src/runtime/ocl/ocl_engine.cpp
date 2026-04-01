@@ -10,6 +10,7 @@
 #include "ocl_memory.hpp"
 #include "ocl_stream.hpp"
 #include "ocl_engine_factory.hpp"
+#include <iostream>
 #include <string>
 #include <vector>
 #include <memory>
@@ -112,6 +113,9 @@ memory::ptr ocl_engine::allocate_memory(const layout& layout, allocation_type ty
         }
 
         if (reset || res->is_memory_reset_needed(layout)) {
+            std::cerr << "[DBG ocl_engine::allocate_memory] ZERO-FILL: format=" << layout.format.to_string()
+                      << " f=" << layout.feature() << " bytes=" << layout.bytes_count()
+                      << " reset=" << reset << " is_memory_reset_needed=" << res->is_memory_reset_needed(layout) << std::endl;
             auto ev = res->fill(get_service_stream());
             if (ev) {
                 get_service_stream().wait_for_events({ev});

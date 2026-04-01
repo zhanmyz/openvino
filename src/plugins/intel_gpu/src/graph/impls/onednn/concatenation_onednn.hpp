@@ -6,6 +6,7 @@
 #include "impls/onednn/utils.hpp"
 #include "registry/implementation_manager.hpp"
 
+#include <iostream>
 #include <memory>
 namespace cldnn {
 namespace onednn {
@@ -81,6 +82,8 @@ struct ConcatenationImplementationManager : public ImplementationManager {
 
         // onednn concatenation doesn't support non-zero padding which can occur for unaligned feature.
         if (!is_feature_aligned(out_layout)) {
+            std::cerr << "[DBG validate_impl] REJECT (output non-aligned): node=" << node.id()
+                      << " out_pshape=" << out_layout.get_partial_shape() << " format=" << out_layout.format.to_string() << std::endl;
             return false;
         }
 
@@ -95,8 +98,17 @@ struct ConcatenationImplementationManager : public ImplementationManager {
 
             if (!one_of(in_layout.format.value, supported_in_fmts))
                 return false;
+
+            if (node.is_dynamic() && !is_feature_aligned(in_layout)) {
+                std::cerr << "[DBG validate_impl] REJECT (dynamic + input non-aligned): node=" << node.id()
+                          << " in_pshape=" << in_layout.get_partial_shape() << " is_dynamic=" << node.is_dynamic() << std::endl;
+                return false;
+            }
         }
 
+        std::cerr << "[DBG validate_impl] ACCEPT onednn: node=" << node.id()
+                  << " is_dynamic=" << node.is_dynamic() << " out_pshape=" << out_layout.get_partial_shape()
+                  << " format=" << out_layout.format.to_string() << std::endl;
         return true;
     }
 };

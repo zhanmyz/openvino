@@ -57,6 +57,7 @@
 #include "intel_gpu/runtime/tensor_accessor.hpp"
 
 #include "json_object.h"
+#include <iostream>
 #include <string>
 #include <vector>
 #include <memory>
@@ -1139,6 +1140,10 @@ void primitive_inst::realloc_outputs(bool prev_execution_skipped) {
                                    << " Current buffer_size=" << _max_output_layout_count[i]
                                    << " Requested buffer_size=" << updated_layouts[i].get_linear_size()
                                    << std::endl;
+            std::cerr << "[DBG primitive_inst::realloc_outputs] REALLOC: prim=" << id()
+                      << " format=" << actual_layouts[i].format.to_string()
+                      << " pshape=" << actual_layouts[i].get_partial_shape()
+                      << " reset=false (dynamic realloc)" << std::endl;
             _outputs[i] = allocate_output(get_network().get_engine(),
                                           get_network().get_memory_pool(),
                                           *_node,
@@ -2737,8 +2742,16 @@ memory::ptr primitive_inst::allocate_output(engine& _engine,
         }
     } else if (!node.can_share_buffer() || impl_params.can_be_optimized() || node.is_output()) {
         GPU_DEBUG_LOG << "[" << node.id() << ": output]" << std::endl;
+        std::cerr << "[DBG allocate_output] DIRECT engine.allocate_memory: prim=" << node.id()
+                  << " format=" << layout.format.to_string() << " f=" << layout.feature()
+                  << " reset=" << reset << " (can_share=" << node.can_share_buffer()
+                  << " optimized=" << impl_params.can_be_optimized()
+                  << " is_output=" << node.is_output() << ")" << std::endl;
         return _engine.allocate_memory(layout, alloc_type, reset);
     } else {
+        std::cerr << "[DBG allocate_output] VIA POOL: prim=" << node.id()
+                  << " format=" << layout.format.to_string() << " f=" << layout.feature()
+                  << " reset=" << reset << " reusable=" << reusable_across_network << std::endl;
         return get_memory_from_pool(_engine,
                                     net_id,
                                     pool,

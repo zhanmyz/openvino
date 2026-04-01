@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <fstream>
+#include <iostream>
 #include <vector>
 
 #include "intel_gpu/runtime/memory.hpp"
@@ -194,6 +195,9 @@ memory::ptr memory_pool::get_from_non_padded_pool(const layout& layout,
             !has_conflict(it->second._users, restrictions))) {
             it->second._users.insert(memory_user(MEM_USER(unique_id, network_id, prim_id, layout_bytes_count)));
             auto ret_mem = _engine->reinterpret_buffer(*it->second._memory, layout);
+            std::cerr << "[DBG memory_pool::get_from_non_padded_pool] REUSE (NO zero-fill): prim=" << prim_id
+                      << " format=" << layout.format.to_string() << " f=" << layout.feature()
+                      << " bytes=" << layout_bytes_count << " pool_buf=" << ret_mem->buffer_ptr() << std::endl;
             ret_mem->from_memory_pool = true;
             return ret_mem;
         } else {
@@ -202,6 +206,9 @@ memory::ptr memory_pool::get_from_non_padded_pool(const layout& layout,
     }
     GPU_DEBUG_LOG << "[" << prim_id << "(" << unique_id << "): output]" << std::endl;
     // didn't find anything for you? create new resource
+    std::cerr << "[DBG memory_pool::get_from_non_padded_pool] NEW ALLOC: prim=" << prim_id
+              << " format=" << layout.format.to_string() << " f=" << layout.feature()
+              << " bytes=" << layout_bytes_count << " reset=" << reset << std::endl;
     auto mem = alloc_memory(layout, type, reset);
     {
         _non_padded_pool.emplace(layout_bytes_count,
