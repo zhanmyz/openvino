@@ -80,6 +80,7 @@ std::map<std::string, Version> Core::get_versions(const std::string& device_name
 std::shared_ptr<ov::Model> Core::read_model(const std::filesystem::path& model_path,
                                             const std::filesystem::path& bin_path,
                                             const ov::AnyMap& properties) const {
+    std::cerr << "[trace] " << __PRETTY_FUNCTION__ << " @ " << __FILE__ << ":" << __LINE__ << std::endl;
     OV_ITT_SCOPED_REGION_BASE(ov::itt::domains::Phases, "Read model");
     OV_CORE_CALL_STATEMENT(return _impl->read_model(model_path, bin_path, properties););
 }
@@ -88,6 +89,7 @@ std::shared_ptr<ov::Model> Core::read_model(const std::filesystem::path& model_p
 std::shared_ptr<ov::Model> Core::read_model(const std::wstring& model_path,
                                             const std::wstring& bin_path,
                                             const ov::AnyMap& properties) const {
+    std::cerr << "[trace] " << __PRETTY_FUNCTION__ << " @ " << __FILE__ << ":" << __LINE__ << std::endl;
     OV_ITT_SCOPED_REGION_BASE(ov::itt::domains::Phases, "Read model");
     return read_model(ov::util::make_path(model_path), ov::util::make_path(bin_path), properties);
 }
@@ -96,11 +98,13 @@ std::shared_ptr<ov::Model> Core::read_model(const std::wstring& model_path,
 std::shared_ptr<ov::Model> Core::read_model(const std::string& model_path,
                                             const std::string& bin_path,
                                             const AnyMap& properties) const {
+    std::cerr << "[trace] " << __PRETTY_FUNCTION__ << " @ " << __FILE__ << ":" << __LINE__ << std::endl;
     OV_ITT_SCOPED_REGION_BASE(ov::itt::domains::Phases, "Read model");
     return read_model(ov::util::make_path(model_path), ov::util::make_path(bin_path), properties);
 }
 
 std::shared_ptr<ov::Model> Core::read_model(const std::string& model, const ov::Tensor& weights) const {
+    std::cerr << "[trace] " << __PRETTY_FUNCTION__ << " @ " << __FILE__ << ":" << __LINE__ << std::endl;
     OV_ITT_SCOPED_REGION_BASE(ov::itt::domains::Phases, "Read model");
     OV_CORE_CALL_STATEMENT(return _impl->read_model(model, weights););
 }

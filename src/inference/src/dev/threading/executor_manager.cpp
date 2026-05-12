@@ -114,13 +114,17 @@ void ExecutorManagerImpl::reset_tbb() {
 
 std::shared_ptr<ov::threading::ITaskExecutor> ExecutorManagerImpl::get_executor(const std::string& id) {
     std::lock_guard<std::mutex> guard(taskExecutorMutex);
+    std::cerr << "[trace] ExecutorManagerImpl::get_executor(\"" << id << "\")" << std::endl;
     auto foundEntry = executors.find(id);
     if (foundEntry == executors.end()) {
+        std::cerr << "[trace]   未找到已有executor → 创建新 CPUStreamsExecutor(\"" << id << "\")" << std::endl;
         auto newExec = std::make_shared<ov::threading::CPUStreamsExecutor>(ov::threading::IStreamsExecutor::Config{id});
         tbbThreadsCreated = true;
         executors[id] = newExec;
+        std::cerr << "[trace]   executors 总数=" << executors.size() << ", tbbThreadsCreated=true" << std::endl;
         return newExec;
     }
+    std::cerr << "[trace]   复用已有executor(\"" << id << "\")" << std::endl;
     return foundEntry->second;
 }
 
@@ -190,13 +194,21 @@ public:
     ExecutorManagerHolder(const ExecutorManagerHolder&) = delete;
     ExecutorManagerHolder& operator=(const ExecutorManagerHolder&) = delete;
 
-    ExecutorManagerHolder() = default;
+    ExecutorManagerHolder() {
+        std::cerr << "[trace] ExecutorManagerHolder 构造 (static局部变量, 进程生命周期只执行一次)" << std::endl;
+    }
 
     std::shared_ptr<ov::threading::ExecutorManager> get() {
         std::lock_guard<std::mutex> lock(_mutex);
+        std::cerr << "[trace] ExecutorManagerHolder::get() → weak_ptr::lock() 尝试提升..." << std::endl;
         auto manager = _manager.lock();
         if (!manager) {
+            std::cerr << "[trace]   weak_ptr 为空(首次 或 旧manager已销毁) → 创建新 ExecutorManagerImpl" << std::endl;
             _manager = manager = std::make_shared<ExecutorManagerImpl>();
+            std::cerr << "[trace]   新 ExecutorManagerImpl 创建完毕, use_count=" << manager.use_count()
+                      << " (weak_ptr不增加计数)" << std::endl;
+        } else {
+            std::cerr << "[trace]   weak_ptr 提升成功(已有manager存活), use_count=" << manager.use_count() << std::endl;
         }
         return manager;
     }
@@ -205,7 +217,9 @@ public:
 }  // namespace
 
 std::shared_ptr<ExecutorManager> executor_manager() {
+    std::cerr << "[trace] executor_manager() 被调用" << std::endl;
     static ExecutorManagerHolder executorManagerHolder;
+    std::cerr << "[trace] 调用 executorManagerHolder.get()" << std::endl;
     return executorManagerHolder.get();
 }
 

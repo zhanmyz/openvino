@@ -1796,6 +1796,7 @@ std::mutex& ov::CoreImpl::get_mutex(const std::string& dev_name) const {
 void ov::CoreImpl::add_mutex(const std::string& dev_name) {
     std::lock_guard<std::mutex> lock(m_global_mutex);
     m_dev_mutexes[dev_name];
+    std::cerr << "[trace] add_mutex: \"" << dev_name << "\", total=" << m_dev_mutexes.size() << std::endl;
 }
 
 std::shared_ptr<ov::Model> ov::CoreImpl::read_model(const std::filesystem::path& model_path,
