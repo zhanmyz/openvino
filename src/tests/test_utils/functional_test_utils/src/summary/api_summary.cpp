@@ -4,7 +4,10 @@
 
 #include "functional_test_utils/summary/api_summary.hpp"
 
+#include <chrono>
+#include <iostream>
 #include <pugixml.hpp>
+#include <thread>
 
 #include "common_test_utils/file_utils.hpp"
 
@@ -218,15 +221,31 @@ void ApiSummary::saveReport() {
         }
     }
 
+    // CVS-182877: see op_summary.cpp for rationale. Retry with sleep, log
+    // on final failure rather than throwing from auxiliary tear-down code.
+    constexpr int kSaveRetryAttempts = 10;
+    constexpr auto kSaveRetryInterval = std::chrono::milliseconds(500);
     auto exitTime = std::chrono::system_clock::now() + std::chrono::seconds(saveReportTimeout);
     bool result = false;
-    do {
+    for (int attempt = 0; attempt < kSaveRetryAttempts; ++attempt) {
         result = doc.save_file(outputFilePath.c_str());
-    } while (!result && std::chrono::system_clock::now() < exitTime);
+        if (result) break;
+        if (attempt + 1 < kSaveRetryAttempts) {
+            std::cerr << "[api_summary] save_file failed for " << outputFilePath
+                      << " (attempt " << (attempt + 1) << "/" << kSaveRetryAttempts
+                      << "); retrying in " << kSaveRetryInterval.count() << "ms" << std::endl;
+            std::this_thread::sleep_for(kSaveRetryInterval);
+        }
+    }
+    while (!result && std::chrono::system_clock::now() < exitTime) {
+        result = doc.save_file(outputFilePath.c_str());
+        if (!result) std::this_thread::sleep_for(kSaveRetryInterval);
+    }
 
     if (!result) {
-        std::string errMessage = "Failed to write report to " + outputFilePath;
-        throw std::runtime_error(errMessage);
+        std::cerr << "[api_summary] Failed to write report to " << outputFilePath
+                  << " after " << kSaveRetryAttempts
+                  << " retries; continuing without the report (CVS-182877)" << std::endl;
     } else {
         isReported = true;
     }

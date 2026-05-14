@@ -5,7 +5,10 @@
 #include "functional_test_utils/summary/op_summary.hpp"
 
 #include <algorithm>
+#include <chrono>
+#include <iostream>
 #include <pugixml.hpp>
+#include <thread>
 
 #include "common_test_utils/file_utils.hpp"
 #include "functional_test_utils/summary/op_info.hpp"
@@ -359,15 +362,36 @@ void OpSummary::saveReport() {
         }
     }
 
+    // CVS-182877: writing the coverage report can hit transient I/O errors on CI
+    // (e.g. overlay2 in Docker on GHA runners). Retry with a real sleep between
+    // attempts. On final failure, log to std::cerr instead of throwing, so that
+    // a passing test process is not marked failed just because the auxiliary
+    // coverage artifact could not be written.
+    constexpr int kSaveRetryAttempts = 10;
+    constexpr auto kSaveRetryInterval = std::chrono::milliseconds(500);
     auto exitTime = std::chrono::system_clock::now() + std::chrono::seconds(saveReportTimeout);
     bool result = false;
-    do {
+    for (int attempt = 0; attempt < kSaveRetryAttempts; ++attempt) {
         result = doc.save_file(outputFilePath.c_str());
-    } while (!result && std::chrono::system_clock::now() < exitTime);
+        if (result) break;
+        if (attempt + 1 < kSaveRetryAttempts) {
+            std::cerr << "[op_summary] save_file failed for " << outputFilePath
+                      << " (attempt " << (attempt + 1) << "/" << kSaveRetryAttempts
+                      << "); retrying in " << kSaveRetryInterval.count() << "ms" << std::endl;
+            std::this_thread::sleep_for(kSaveRetryInterval);
+        }
+    }
+    // Honor the legacy --save_report_timeout knob: keep busy-spinning until exitTime
+    // if the user explicitly requested a longer overall budget.
+    while (!result && std::chrono::system_clock::now() < exitTime) {
+        result = doc.save_file(outputFilePath.c_str());
+        if (!result) std::this_thread::sleep_for(kSaveRetryInterval);
+    }
 
     if (!result) {
-        std::string errMessage = "Failed to write report to " + outputFilePath;
-        throw std::runtime_error(errMessage);
+        std::cerr << "[op_summary] Failed to write report to " << outputFilePath
+                  << " after " << kSaveRetryAttempts
+                  << " retries; continuing without the report (CVS-182877)" << std::endl;
     } else {
         isReported = true;
     }
