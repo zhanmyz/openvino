@@ -7,7 +7,10 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdlib>
 #include <deque>
+#include <functional>
+#include <iostream>
 #include <limits>
 #include <memory>
 #include <string>
@@ -460,6 +463,46 @@ bool TransformationsPipeline::fuse_type_to_convert(const std::shared_ptr<ov::Nod
     return true;
 }
 
+// CVS-166954 debug helper: locates a node by friendly name in the model and any
+// nested subgraph (Loop/TensorIterator/If body) and prints the rank of each of
+// its inputs at a given pipeline stage. Used to bisect which transformation
+// corrupts a node's input rank. Enable by setting OV_DEBUG_CVS_166954=1 and
+// OV_DEBUG_CVS_166954_NODE=<friendly_name> (defaults to "Slice_2419").
+static void debug_trace_node_by_name(const std::shared_ptr<ov::Model>& model,
+                                     const std::string& stage) {
+    if (!std::getenv("OV_DEBUG_CVS_166954"))
+        return;
+    const char* env_name = std::getenv("OV_DEBUG_CVS_166954_NODE");
+    const std::string target = env_name ? env_name : "Slice_2419";
+    std::function<void(const std::shared_ptr<ov::Model>&, const std::string&)> walk;
+    walk = [&](const std::shared_ptr<ov::Model>& m, const std::string& scope) {
+        for (const auto& node : m->get_ops()) {
+            if (node->get_friendly_name() == target) {
+                std::cerr << "[DEBUG][" << stage << "] '" << target
+                          << "' type=" << node->get_type_name()
+                          << " scope=" << scope << std::endl;
+                for (size_t i = 0; i < node->get_input_size(); i++) {
+                    auto in_node = node->input_value(i).get_node_shared_ptr();
+                    std::cerr << "  input[" << i << "]: name='"
+                              << in_node->get_friendly_name() << "' type="
+                              << in_node->get_type_name()
+                              << " et=" << node->get_input_element_type(i)
+                              << " shape=" << node->get_input_partial_shape(i)
+                              << std::endl;
+                }
+            }
+            if (auto sg = std::dynamic_pointer_cast<ov::op::util::MultiSubGraphOp>(node)) {
+                for (size_t idx = 0; idx < sg->get_internal_subgraphs_size(); idx++) {
+                    if (auto body = sg->get_function(static_cast<int>(idx)))
+                        walk(body, scope + "/" + node->get_friendly_name() +
+                                   "/body_" + std::to_string(idx));
+                }
+            }
+        }
+    };
+    walk(model, "main");
+}
+
 void TransformationsPipeline::apply(std::shared_ptr<ov::Model> func) {
     OV_ITT_SCOPED_TASK(itt::domains::intel_gpu_plugin, "TransformationsPipeline::apply");
     using const_node_ptr = const std::shared_ptr<const ov::Node>;
@@ -470,6 +513,8 @@ void TransformationsPipeline::apply(std::shared_ptr<ov::Model> func) {
     bool unroll_loop = config.get_enable_loop_unrolling();
     const bool disable_gated_mlp_fusion = GPU_DEBUG_VALUE_OR(config.get_disable_gated_mlp_fusion(), true);
     auto is_model_quantized = ov::pass::low_precision::LowPrecision::isFunctionQuantized(func);
+
+    debug_trace_node_by_name(func, "INITIAL");
 
     // call conversion of float types with keep_precision_sensitive_in_fp32 = true
     auto fp_precision_supported = [&](ov::element::Type e) -> bool {

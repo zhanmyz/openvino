@@ -5,6 +5,8 @@
 #include "transformations/common_optimizations/move_eltwise_up_data_movement.hpp"
 
 #include <algorithm>
+#include <cstdlib>
+#include <iostream>
 #include <memory>
 
 #include "itt.hpp"
@@ -120,8 +122,30 @@ ov::pass::MoveEltwiseUpThroughDataMovScalar::MoveEltwiseUpThroughDataMovScalar(
             if (current->get_output_partial_shape(0).size() != eltwise->get_input_partial_shape(i).size()) {
                 auto old_eltwise_const = ov::as_type_ptr<ov::opset8::Constant>(eltwise->get_input_node_shared_ptr(i));
                 if (old_eltwise_const->get_shape().size() != 0) {
+                    // CVS-166954 debug probe. Enable by setting OV_DEBUG_CVS_166954=1.
+                    // Prints which constants are being reshaped to scalar by this pass
+                    // and how many consumers they have. A consumer count > 1 was the
+                    // smoking gun showing that the original code was corrupting
+                    // shapes for shared consumers (e.g. StridedSlice 'end' inputs in
+                    // Loop bodies). Kept in-tree to make the bug reproducible.
+                    if (std::getenv("OV_DEBUG_CVS_166954")) {
+                        std::cerr << "[DEBUG_MOVE_ELTWISE] Reshaping constant '"
+                                  << old_eltwise_const->get_friendly_name()
+                                  << "' from shape " << old_eltwise_const->get_shape()
+                                  << " to scalar. Consumers: "
+                                  << old_eltwise_const->get_output_target_inputs(0).size()
+                                  << " eltwise='" << eltwise->get_friendly_name() << "'"
+                                  << std::endl;
+                    }
                     auto new_constant = std::make_shared<ov::opset8::Constant>(*old_eltwise_const.get(), ov::Shape{});
-                    ov::replace_node_update_name(old_eltwise_const, new_constant);
+                    copy_runtime_info(old_eltwise_const, new_constant);
+                    // Only rewire this eltwise input rather than globally replacing the
+                    // constant. The same constant may be shared by other consumers (e.g.,
+                    // a StridedSlice 'end' input inside a Loop/TensorIterator body) that
+                    // require the original (non-scalar) shape. A global replace would
+                    // corrupt those consumers' rank and trigger validation failures such
+                    // as "End input must be 1D (has rank: 0)".
+                    eltwise->input(i).replace_source_output(new_constant->output(0));
                 }
             }
         }
