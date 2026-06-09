@@ -25,90 +25,10 @@ inline INPUT1_TYPE FUNC(decay_linear)(INPUT1_TYPE iou, INPUT1_TYPE max_iou) {
     return (INPUT1_VAL_ONE - iou) / (INPUT1_VAL_ONE - max_iou + TINY);
 }
 
-inline void FUNC(swap)(int* a, int* b) {
-    int temp = *a;
-    *a = *b;
-    *b = temp;
-}
-
-inline void FUNC(sortIterative)(const __global INPUT1_TYPE* scores,
-                                      const int batchId,
-                                      const int classId,
-                                      int* indices,
-                                      const int size) {
-    for (int i = 1; i <= size; i++) {
-        bool swapped = false;
-        for (int j = 0; j < size - i; j++) {
-            const INPUT1_TYPE score_curr = scores[INPUT1_GET_INDEX(batchId, classId, 0, indices[j])];
-            const INPUT1_TYPE score_next = scores[INPUT1_GET_INDEX(batchId, classId, 0, indices[j + 1])];
-            if (score_curr < score_next) {
-                FUNC_CALL(swap)(&indices[j], &indices[j + 1]);
-                swapped = true;
-            }
-        }
-
-        if (!swapped)
-            break;
-    }
-}
-
 inline void FUNC(swap_boxes)(__global BOX_INFO* a, __global BOX_INFO* b) {
     BOX_INFO temp = *a;
     *a = *b;
     *b = temp;
-}
-
-inline void FUNC(sortIterativeBoxes)(__global BOX_INFO* boxes, int l, int h) {
-    for (int i = 1; i < h - l; i++) {
-        bool swapped = false;
-        for (int j = l; j < h - i; j++) {
-            if ((boxes[j].score < boxes[j + 1].score) ||
-                (boxes[j].score == boxes[j + 1].score && boxes[j].class_idx > boxes[j + 1].class_idx) ||
-                (boxes[j].score == boxes[j + 1].score && boxes[j].class_idx == boxes[j + 1].class_idx &&
-                 boxes[j].box_idx > boxes[j + 1].box_idx)) {
-                FUNC_CALL(swap_boxes)(&boxes[j], &boxes[j + 1]);
-                swapped = true;
-            }
-        }
-
-        if (!swapped)
-            break;
-    }
-}
-
-inline void FUNC(sortIterativeBoxesAcrossBatches)(__global BOX_INFO* boxes) {
-    const int size = NUM_BATCHES * NUM_CLASSES * MAX_BOXES_PER_CLASS;
-    for (int i = 1; i < size; i++) {
-        bool swapped = false;
-        for (int j = 0; j < size - i; j++) {
-            __global BOX_INFO* l = boxes + j;
-            __global BOX_INFO* r = boxes + j + 1;
-// sort by score
-#if SORT_TYPE == 1
-            if ((l->score < r->score) || (l->score == r->score && l->batch_idx > r->batch_idx) ||
-                (l->score == r->score && l->batch_idx == r->batch_idx && l->class_idx > r->class_idx) ||
-                (l->score == r->score && l->batch_idx == r->batch_idx && l->class_idx == r->class_idx &&
-                 l->box_idx > r->box_idx)) {
-                FUNC_CALL(swap_boxes)(l, r);
-                swapped = true;
-            }
-// sort by class id
-#elif SORT_TYPE == 0
-            if (r->score != INPUT1_VAL_ZERO &&
-                ((l->score == INPUT1_VAL_ZERO) ||  // case with empty buffer
-                 (l->class_idx > r->class_idx) || (l->class_idx == r->class_idx && l->batch_idx > r->batch_idx) ||
-                 (l->class_idx == r->class_idx && l->batch_idx == r->batch_idx && l->score < r->score) ||
-                 (l->class_idx == r->class_idx && l->batch_idx == r->batch_idx && l->score == r->score &&
-                  l->box_idx > r->box_idx))) {
-                FUNC_CALL(swap_boxes)(l, r);
-                swapped = true;
-            }
-#endif
-        }
-
-        if (!swapped)
-            break;
-    }
 }
 
 inline COORD_TYPE_4 FUNC(getBoxCoords)(const __global INPUT0_TYPE* boxes, const short batch, const ushort box_idx) {
@@ -177,85 +97,137 @@ KERNEL(matrix_nms_ref_stage_0)
         return;
 
     const int offset = batchId * NUM_CLASSES + classId;
-    int sorted_score_indices[NUM_BOXES];
-    int valid_boxes_num = 0;
 
-    const int BLOCK_SIZE = 256;
-    const int num_blocks = (NUM_BOXES + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    for (int i = 0; i < num_blocks; i++) {
-        for (int j = 0; j < BLOCK_SIZE; j++) {
-            const int idx = i * BLOCK_SIZE + j;
-            if (idx >= NUM_BOXES)
-                break;
-            if (input_scores[INPUT1_GET_INDEX(batchId, classId, 0, idx)] > SCORE_THRESHOLD) {
-                sorted_score_indices[valid_boxes_num] = idx;
-                ++valid_boxes_num;
-            }
+    __global BOX_INFO* box_info = (__global BOX_INFO*)buffer0;
+    box_info = &box_info[batchId * NUM_CLASSES * MAX_BOXES_PER_CLASS + classId * MAX_BOXES_PER_CLASS];
+
+    // --- Phase 1: Count scores above threshold and find max score ---
+    // Single read-only pass over input_scores.
+    int count = 0;
+    INPUT1_TYPE max_score = SCORE_THRESHOLD;
+    for (int idx = 0; idx < NUM_BOXES; idx++) {
+        const INPUT1_TYPE score = input_scores[INPUT1_GET_INDEX(batchId, classId, 0, idx)];
+        if (score > SCORE_THRESHOLD) {
+            count++;
+            if (score > max_score)
+                max_score = score;
         }
     }
 
-    for (int i = valid_boxes_num; i < NUM_BOXES; ++i)
-        sorted_score_indices[i] = 0;
+    // --- Phase 2: Collect top candidates into global buffer ---
+    // Uses adaptive threshold to select approximately MAX_BOXES_PER_CLASS elements in one pass.
+    INPUT1_TYPE adj_threshold = SCORE_THRESHOLD;
+    if (count > MAX_BOXES_PER_CLASS) {
+        // Estimate threshold assuming roughly uniform distribution in [SCORE_THRESHOLD, max_score].
+        INPUT1_TYPE range = max_score - SCORE_THRESHOLD;
+        adj_threshold = max_score - range * (INPUT1_TYPE)(MAX_BOXES_PER_CLASS) / (INPUT1_TYPE)count;
+    }
 
-    // TODO: consider faster sorting algorithm
-    FUNC_CALL(sortIterative)(input_scores, batchId, classId, sorted_score_indices, valid_boxes_num);
+    int valid_boxes_num = 0;
+    for (int idx = 0; idx < NUM_BOXES; idx++) {
+        const INPUT1_TYPE score = input_scores[INPUT1_GET_INDEX(batchId, classId, 0, idx)];
+        if (score > adj_threshold && valid_boxes_num < MAX_BOXES_PER_CLASS) {
+            box_info[valid_boxes_num].box_idx = idx;
+            box_info[valid_boxes_num].score = score;
+            valid_boxes_num++;
+        }
+    }
 
-    valid_boxes_num = min(valid_boxes_num, MAX_BOXES_PER_CLASS);
+    if (valid_boxes_num == 0) {
+        for (int i = 0; i < MAX_BOXES_PER_CLASS; i++) {
+            box_info[i].score = INPUT1_VAL_ZERO;
+            box_info[i].batch_idx = 0;
+            box_info[i].class_idx = 0;
+            box_info[i].box_idx = 0;
+        }
+        selected_boxes_num[offset] = 0;
+        return;
+    }
 
-    __global INPUT1_TYPE* iou_matrix = input_iou_matrix + offset * MAX_BOXES_PER_CLASS * sizeof(INPUT1_TYPE);
-    __global INPUT1_TYPE* iou_max = input_iou_max + offset * MAX_BOXES_PER_CLASS * sizeof(INPUT1_TYPE);
-    __global INPUT1_TYPE* min_decays = input_min_decays + offset * MAX_BOXES_PER_CLASS * sizeof(INPUT1_TYPE);
+    // --- Phase 3: Sort collected boxes by score (descending) using selection sort ---
+    // O(K^2) on at most MAX_BOXES_PER_CLASS elements in global memory.
+    for (int i = 0; i < valid_boxes_num - 1; i++) {
+        int max_j = i;
+        INPUT1_TYPE ms = box_info[i].score;
+        int mbi = box_info[i].box_idx;
+        for (int j = i + 1; j < valid_boxes_num; j++) {
+            if (box_info[j].score > ms ||
+                (box_info[j].score == ms && box_info[j].box_idx < mbi)) {
+                ms = box_info[j].score;
+                mbi = box_info[j].box_idx;
+                max_j = j;
+            }
+        }
+        if (max_j != i) {
+            BOX_INFO temp = box_info[i];
+            box_info[i] = box_info[max_j];
+            box_info[max_j] = temp;
+        }
+    }
+
+    // --- Phase 4: Compute IOU matrix and decay factors ---
+    __global INPUT1_TYPE* iou_matrix = input_iou_matrix + offset * MAX_BOXES_PER_CLASS;
+    __global INPUT1_TYPE* iou_max = input_iou_max + offset * MAX_BOXES_PER_CLASS;
+    __global INPUT1_TYPE* min_decays = input_min_decays + offset * MAX_BOXES_PER_CLASS;
 
     iou_max[0] = INPUT1_VAL_ZERO;
     for (int i = 1; i < valid_boxes_num; ++i) {
-        INPUT1_TYPE max_iou = INPUT1_VAL_ZERO;
+        INPUT1_TYPE max_iou_val = INPUT1_VAL_ZERO;
         INPUT1_TYPE min_decay = INPUT1_VAL_ONE;
-        const COORD_TYPE_4 box_i = FUNC_CALL(getBoxCoords)(input_boxes, batchId, sorted_score_indices[i]);
+        const COORD_TYPE_4 box_i = FUNC_CALL(getBoxCoords)(input_boxes, batchId, box_info[i].box_idx);
         for (int j = 0; j < i; ++j) {
-            const COORD_TYPE_4 box_j = FUNC_CALL(getBoxCoords)(input_boxes, batchId, sorted_score_indices[j]);
+            const COORD_TYPE_4 box_j = FUNC_CALL(getBoxCoords)(input_boxes, batchId, box_info[j].box_idx);
             const INPUT1_TYPE iou = FUNC_CALL(intersectionOverUnion)(box_i, box_j);
-
-            max_iou = max(iou, max_iou);
+            max_iou_val = max(iou, max_iou_val);
             iou_matrix[j] = iou;
         }
-        iou_max[i] = max_iou;
+        iou_max[i] = max_iou_val;
 
         for (int j = 0; j < i; ++j) {
             INPUT1_TYPE decay =
-                DECAY_FUNC == 0 ? FUNC_CALL(decay_gaussian)(iou_matrix[j], iou_max[j]) : FUNC_CALL(decay_linear)(iou_matrix[j], iou_max[j]);
+                DECAY_FUNC == 0 ? FUNC_CALL(decay_gaussian)(iou_matrix[j], iou_max[j])
+                                : FUNC_CALL(decay_linear)(iou_matrix[j], iou_max[j]);
             min_decay = min(min_decay, decay);
         }
         min_decays[i] = min_decay;
     }
 
-    const INPUT1_TYPE first_score = input_scores[INPUT1_GET_INDEX(batchId, classId, 0, sorted_score_indices[0])];
-
-    __global BOX_INFO* box_info = (__global BOX_INFO*)buffer0;
-    box_info = &box_info[batchId * NUM_CLASSES * MAX_BOXES_PER_CLASS + classId * MAX_BOXES_PER_CLASS];
-
+    // --- Phase 5: Apply post-threshold filter and write final results ---
+    const INPUT1_TYPE first_score = input_scores[INPUT1_GET_INDEX(batchId, classId, 0, box_info[0].box_idx)];
     int box_info_counter = 0;
-    if (first_score > POST_THRESHOLD && valid_boxes_num > 0) {
-        box_info[box_info_counter].class_idx = classId;
-        box_info[box_info_counter].score = first_score;
-        box_info[box_info_counter].box_idx = sorted_score_indices[0];
-        box_info[box_info_counter].batch_idx = batchId;
-        ++box_info_counter;
+
+    if (first_score > POST_THRESHOLD) {
+        int first_box_idx = box_info[0].box_idx;
+        box_info[0].batch_idx = batchId;
+        box_info[0].class_idx = classId;
+        box_info[0].box_idx = first_box_idx;
+        box_info[0].score = first_score;
+        box_info_counter = 1;
     }
 
     for (int i = 1; i < valid_boxes_num; ++i) {
-        INPUT1_TYPE ds = min_decays[i] * input_scores[INPUT1_GET_INDEX(batchId, classId, 0, sorted_score_indices[i])];
+        int cur_box_idx = box_info[i].box_idx;
+        INPUT1_TYPE ds = min_decays[i] * input_scores[INPUT1_GET_INDEX(batchId, classId, 0, cur_box_idx)];
 
         if (ds <= POST_THRESHOLD)
             continue;
 
         box_info[box_info_counter].batch_idx = batchId;
         box_info[box_info_counter].class_idx = classId;
-        box_info[box_info_counter].box_idx = sorted_score_indices[i];
+        box_info[box_info_counter].box_idx = cur_box_idx;
         box_info[box_info_counter].score = ds;
         ++box_info_counter;
     }
 
-    selected_boxes_num[batchId * NUM_CLASSES + classId] = box_info_counter;
+    // Zero out unused positions so Stage 1 partial sort terminates early
+    for (int i = box_info_counter; i < MAX_BOXES_PER_CLASS; i++) {
+        box_info[i].score = INPUT1_VAL_ZERO;
+        box_info[i].batch_idx = 0;
+        box_info[i].class_idx = 0;
+        box_info[i].box_idx = 0;
+    }
+
+    selected_boxes_num[offset] = box_info_counter;
 }
 #endif /* MATRIX_NMS_STAGE_0 */
 
@@ -269,15 +241,41 @@ KERNEL(matrix_nms_ref_stage_1)
     const int first_idx = batchId * NUM_CLASSES * MAX_BOXES_PER_CLASS;
     const int last_idx = first_idx + NUM_CLASSES * MAX_BOXES_PER_CLASS;
 
-    // TODO: consider faster sorting algorithm
-    FUNC_CALL(sortIterativeBoxes)(box_info, first_idx, last_idx);
-
+    // Count total valid entries across all classes for this batch
+    int total_valid = 0;
     for (int i = 0; i < NUM_CLASSES; ++i) {
         if (i == BACKGROUND_CLASS)
             continue;
-
-        valid_outputs[OUTPUT2_GET_INDEX(batchId, 0, 0, 0)] += selected_boxes_num[batchId * NUM_CLASSES + i];
+        total_valid += selected_boxes_num[batchId * NUM_CLASSES + i];
     }
+
+    // Partial selection sort: find top-K entries from [first_idx, last_idx).
+    // Uses O(N*K) instead of O(N^2) bubble sort to avoid GPU TDR timeout.
+    const int n = last_idx - first_idx;
+    int k = (KEEP_TOP_K > 0 && KEEP_TOP_K < total_valid) ? KEEP_TOP_K : total_valid;
+    if (k > n) k = n;
+
+    for (int i = 0; i < k; i++) {
+        int max_j = first_idx + i;
+        for (int j = first_idx + i + 1; j < last_idx; j++) {
+            __global BOX_INFO* cur = &box_info[j];
+            __global BOX_INFO* best = &box_info[max_j];
+            if ((cur->score > best->score) ||
+                (cur->score == best->score && cur->class_idx < best->class_idx) ||
+                (cur->score == best->score && cur->class_idx == best->class_idx &&
+                 cur->box_idx < best->box_idx)) {
+                max_j = j;
+            }
+        }
+        // If best remaining has score 0, no more valid entries
+        if (box_info[max_j].score == INPUT1_VAL_ZERO)
+            break;
+        if (max_j != first_idx + i) {
+            FUNC_CALL(swap_boxes)(&box_info[first_idx + i], &box_info[max_j]);
+        }
+    }
+
+    valid_outputs[OUTPUT2_GET_INDEX(batchId, 0, 0, 0)] = total_valid;
 }
 #endif /* MATRIX_NMS_STAGE_1 */
 
@@ -290,10 +288,53 @@ KERNEL(matrix_nms_ref_stage_2)
  __global uchar* buffer0) {
     __global BOX_INFO* box_info = (__global BOX_INFO*)buffer0;
 
-    // TODO: consider faster sorting algorithm
-    // and index sorting instead of data sorting
+    // Partial selection sort across batches if required.
+    // Only sorts the needed top-K entries to avoid O(N^2) timeout.
 #if SORT_RESULT_ACROSS_BATCH == 1 && SORT_TYPE != 2
-    FUNC_CALL(sortIterativeBoxesAcrossBatches)(box_info);
+    {
+        const int total_size = NUM_BATCHES * NUM_CLASSES * MAX_BOXES_PER_CLASS;
+        int total_valid = 0;
+        for (int i = 0; i < NUM_BATCHES; ++i)
+            total_valid += valid_outputs[OUTPUT2_GET_INDEX(i, 0, 0, 0)];
+        int k = (KEEP_TOP_K > 0 && KEEP_TOP_K < total_valid) ? KEEP_TOP_K : total_valid;
+        if (k > total_size) k = total_size;
+
+        for (int i = 0; i < k; i++) {
+            int max_j = i;
+            for (int j = i + 1; j < total_size; j++) {
+                __global BOX_INFO* cur = &box_info[j];
+                __global BOX_INFO* best = &box_info[max_j];
+#if SORT_TYPE == 1
+                // Sort by score descending
+                if ((cur->score > best->score) ||
+                    (cur->score == best->score && cur->batch_idx < best->batch_idx) ||
+                    (cur->score == best->score && cur->batch_idx == best->batch_idx &&
+                     cur->class_idx < best->class_idx) ||
+                    (cur->score == best->score && cur->batch_idx == best->batch_idx &&
+                     cur->class_idx == best->class_idx && cur->box_idx < best->box_idx)) {
+                    max_j = j;
+                }
+#elif SORT_TYPE == 0
+                // Sort by class id
+                if (cur->score != INPUT1_VAL_ZERO &&
+                    ((best->score == INPUT1_VAL_ZERO) ||
+                     (cur->class_idx < best->class_idx) ||
+                     (cur->class_idx == best->class_idx && cur->batch_idx < best->batch_idx) ||
+                     (cur->class_idx == best->class_idx && cur->batch_idx == best->batch_idx &&
+                      cur->score > best->score) ||
+                     (cur->class_idx == best->class_idx && cur->batch_idx == best->batch_idx &&
+                      cur->score == best->score && cur->box_idx < best->box_idx))) {
+                    max_j = j;
+                }
+#endif
+            }
+            if (box_info[max_j].score == INPUT1_VAL_ZERO)
+                break;
+            if (max_j != i) {
+                FUNC_CALL(swap_boxes)(&box_info[i], &box_info[max_j]);
+            }
+        }
+    }
 #endif
 
     int output_idx = 0;
