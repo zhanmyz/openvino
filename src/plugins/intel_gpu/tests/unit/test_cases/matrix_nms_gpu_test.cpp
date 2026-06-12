@@ -9,6 +9,7 @@
 #include <intel_gpu/primitives/mutable_data.hpp>
 #include <intel_gpu/runtime/memory.hpp>
 
+#include "matrix_nms_inst.h"
 #include "test_utils.h"
 
 using namespace cldnn;
@@ -672,6 +673,171 @@ matrix_nms_test_inputs get_matrix_nms_large_value_of_max_boxes_per_class() {
             ov::op::v8::MatrixNms::SortResultType::SCORE,  // sort_result_type
             ov::op::v8::MatrixNms::DecayFunction::LINEAR,  // decay_function
             "large_value_of_max_boxes_per_class"};
+}
+
+// Regression test for CVS-186753 -- targets the typed-pointer over-stride bug
+// on the iou_matrix / iou_max / min_decays internal buffers of matrix_nms_ref.
+//
+// Pre-fix code in matrix_nms_ref.cl did:
+//     __global INPUT1_TYPE* iou_matrix =
+//         input_iou_matrix + offset * MAX_BOXES_PER_CLASS * sizeof(INPUT1_TYPE);
+// OpenCL typed-pointer arithmetic already strides by sizeof(element), so the
+// extra `* sizeof(INPUT1_TYPE)` over-multiplied the offset by 4x for f32.
+// For offset > 0, every IOU/decay write therefore landed past the end of the
+// allocated 4-byte * batches * classes * MAX_BOXES_PER_CLASS region; on
+// Windows GPU the OOB writes corrupted neighbouring driver memory and
+// triggered a TDR. The post-fix kernel removes the sizeof().
+//
+// On Linux / some IGC versions the corruption was hidden because reads were
+// symmetrically over-strided in the same kernel, so the kernel's *output*
+// values stayed consistent end-to-end. This regression test therefore does
+// NOT rely on output values -- it inspects the iou_matrix internal buffer
+// directly after execute() and asserts that the in-bounds slice for the
+// active class (offset = 1) actually received the IOU values that the kernel
+// is supposed to write there.
+//
+// A/B behaviour:
+//   * Post-fix kernel: writes go to the correct iou_matrix[offset*K + j],
+//     so the in-bounds slice contains non-zero IOU values for the active
+//     class -- this test PASSES.
+//   * Pre-fix kernel: writes go to iou_matrix[offset*K*sizeof(T) + j] which
+//     is way past the buffer end; the in-bounds slice retains the zero from
+//     the allocator's reset=true initial value -- this test FAILS.
+TEST(matrix_nms_gpu_test, iou_matrix_buffer_offset_regression_cvs_186753) {
+    auto& engine = get_test_engine();
+    const auto data_type = data_types::f32;
+    const auto plain_format = format::bfyx;
+
+    // Configuration: 1 batch, 2 classes (class 0 = background), 4 boxes.
+    // background_class = 0 ensures the kernel's BACKGROUND_CLASS early-return
+    // path runs for offset = 0 and the over-strided write path runs only for
+    // offset = batchId * NUM_CLASSES + classId = 0 * 2 + 1 = 1 -- exactly the
+    // offset value where Bug C produces the largest absolute mis-stride for
+    // small MAX_BOXES_PER_CLASS.
+    const int num_batches = 1;
+    const int num_classes = 2;
+    const int num_boxes = 4;
+    const int keep_top_k = 4;  // becomes MAX_BOXES_PER_CLASS in the kernel
+    const int background_class = 0;
+
+    // Boxes with overlap so Stage 0 Phase 4 actually populates iou_matrix
+    // with non-zero values for multiple (i, j) pairs.
+    const std::vector<float> boxes_values = {
+        0.0f, 0.0f,   1.0f, 1.0f,
+        0.0f, 0.1f,   1.0f, 1.1f,
+        0.0f, 0.2f,   1.0f, 1.2f,
+        0.0f, 0.3f,   1.0f, 1.3f,
+    };
+    // Per-class scores: class 0 (background) gets zeros; class 1 gets a
+    // descending ladder that produces 4 valid boxes after the score_threshold
+    // filter so Stage 0 has work to do.
+    std::vector<float> scores_values(num_classes * num_boxes, 0.0f);
+    scores_values[num_boxes * 1 + 0] = 0.95f;
+    scores_values[num_boxes * 1 + 1] = 0.85f;
+    scores_values[num_boxes * 1 + 2] = 0.75f;
+    scores_values[num_boxes * 1 + 3] = 0.65f;
+
+    auto boxes = engine.allocate_memory(
+        {data_type, plain_format, tensor{num_batches, num_boxes, 1, 4}});
+    auto scores = engine.allocate_memory(
+        {data_type, plain_format, tensor{num_batches, num_classes, 1, num_boxes}});
+    auto selected_boxes = engine.allocate_memory(
+        {data_types::i32, plain_format, tensor{keep_top_k, 1, 1, 1}});
+    auto valid_outputs = engine.allocate_memory(
+        {data_types::i32, plain_format, tensor{num_batches, 1, 1, 1}});
+    set_values(boxes, boxes_values);
+    set_values(scores, scores_values);
+
+    const ov::op::v8::MatrixNms::Attributes attrs(
+        ov::op::v8::MatrixNms::SortResultType::CLASSID,
+        false,                  // sort_result_across_batch
+        ov::element::i32,
+        0.0f,                   // score_threshold (keep all 4)
+        -1,                     // nms_top_k (no cap)
+        keep_top_k,             // keep_top_k (-> MAX_BOXES_PER_CLASS)
+        background_class,
+        ov::op::v8::MatrixNms::DecayFunction::LINEAR,
+        2.0f,                   // gaussian_sigma
+        0.0f,                   // post_threshold (don't filter on decay)
+        true);                  // normalized
+
+    topology topology;
+    topology.add(input_layout("boxes", boxes->get_layout()));
+    topology.add(input_layout("scores", scores->get_layout()));
+    topology.add(mutable_data("selected_boxes", selected_boxes));
+    topology.add(mutable_data("valid_outputs", valid_outputs));
+    topology.add(reorder("reordered_boxes", input_info("boxes"), plain_format, data_type));
+    topology.add(reorder("reordered_scores", input_info("scores"), plain_format, data_type));
+    topology.add(matrix_nms("matrix_nms_prim",
+                            input_info("reordered_boxes"),
+                            input_info("reordered_scores"),
+                            input_info("selected_boxes"),
+                            input_info("valid_outputs"),
+                            attrs));
+    topology.add(reorder("matrix_nms_out", input_info("matrix_nms_prim"), plain_format, data_type));
+
+    network network(engine, topology, get_test_default_config(engine));
+    network.set_input_data("boxes", boxes);
+    network.set_input_data("scores", scores);
+
+    auto outputs = network.execute();
+
+    // Synchronize GPU execution by reading the output before inspecting
+    // internal buffers, ensuring Stage 0 kernel has completed.
+    auto output = outputs.at("matrix_nms_out").get_memory();
+    cldnn::mem_lock<float, mem_lock_type::read> output_ptr(output, get_test_stream());
+    ASSERT_GT(output_ptr.size(), 0u);  // sanity: kernel produced output
+
+    // Internal buffer layout from matrix_nms_kernel_ref.cpp:
+    //   [0] box_info       (BOX_INFO * batches * classes * MAX_BOXES_PER_CLASS)
+    //   [1] sel_boxes_num  (int      * batches * classes)
+    //   [2] iou_matrix     (float    * batches * classes * MAX_BOXES_PER_CLASS)
+    //   [3] iou_max        (float    * batches * classes * MAX_BOXES_PER_CLASS)
+    //   [4] min_decays     (float    * batches * classes * MAX_BOXES_PER_CLASS)
+    auto inst = network.get_primitive("matrix_nms_prim");
+    const auto& internals = inst->get_intermediates_memories();
+    ASSERT_GE(internals.size(), 5u);
+
+    const size_t expected_floats =
+        static_cast<size_t>(num_batches) * num_classes * keep_top_k;
+    auto iou_matrix_mem = internals[2];
+    ASSERT_EQ(iou_matrix_mem->size(), expected_floats * sizeof(float));
+
+    cldnn::mem_lock<float, mem_lock_type::read> iou_matrix_lock(iou_matrix_mem, get_test_stream());
+
+    // offset for the active (non-background) class:
+    //   offset = batchId * NUM_CLASSES + classId = 0 * 2 + 1 = 1
+    // The kernel writes iou_matrix[offset * MAX_BOXES_PER_CLASS + j] for
+    // j in [0, valid_boxes_num). With 4 above-threshold boxes and
+    // MAX_BOXES_PER_CLASS = 4 these writes cover j = 0, 1, 2 (Phase 4 loop
+    // skips j == i, so each i in [1, 4) writes (i-1) entries before
+    // resetting iou_max[i] to 0 -- the cumulative effect is that
+    // iou_matrix[offset*K + 0], [offset*K + 1], [offset*K + 2] all receive
+    // non-zero IOU values from the overlapping boxes above).
+    const int offset = 0 * num_classes + 1;
+    const size_t base = static_cast<size_t>(offset) * keep_top_k;
+    ASSERT_LE(base + keep_top_k, expected_floats);
+
+    // Post-fix: at least one of the in-bounds iou_matrix slots for the
+    // active class must have been overwritten (non-zero IOU value) by a
+    // real IOU value from Stage 0 Phase 4.
+    // Pre-fix: the writes are over-strided past the buffer end, so the
+    // entire in-bounds slice for the active class retains the allocator's
+    // initial zero value and this assertion fails.
+    bool any_overwritten = false;
+    for (int j = 0; j < keep_top_k; ++j) {
+        if (iou_matrix_lock[base + j] != 0.0f) {
+            any_overwritten = true;
+            break;
+        }
+    }
+    ASSERT_TRUE(any_overwritten)
+        << "iou_matrix slice for offset=" << offset
+        << " (base=" << base << ", K=" << keep_top_k
+        << ") is all-zero after execute(). "
+           "This indicates that Stage 0's writes were over-strided past "
+           "the buffer end -- the typed-pointer * sizeof(INPUT1_TYPE) bug "
+           "in matrix_nms_ref.cl is back. See CVS-186753.";
 }
 
 const std::vector<format::type> layout_formats = {format::bfyx,
