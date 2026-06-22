@@ -14,10 +14,12 @@
 #include <transformations/rt_info/disable_precision_conversion.hpp>
 
 #include "plugin/transformations/disable_fp16_comp_rms.hpp"
+#include "plugin/transformations/disable_fp16_comp_for_rms_norm_block.hpp"
 #include "ov_ops/rms.hpp"
 #include "openvino/op/parameter.hpp"
 #include "openvino/op/constant.hpp"
 #include "openvino/op/add.hpp"
+#include "openvino/op/matmul.hpp"
 
 using namespace testing;
 using namespace ov::intel_gpu;
@@ -135,4 +137,48 @@ TEST(TransformationTests, DisableFP16CompForRMS_Negative) {
         {name_rms_2, false}
     };
     run_test(model, expected_status);
+}
+
+// ==================== DisableFP16CompForRMSNormBlock tests ====================
+
+// This test verifies that DisableFP16CompForRMSNormBlock keeps RMS nodes in FP32
+// even when they are NOT covered by DisableFP16CompForGemma3RMSPattern.
+//
+// Without the pass: ConvertPrecision converts the RMS to FP16, leading to
+// numerical instability (INF*0=NaN) on models with large activations (T5/ParlerTTS).
+//
+// With the pass: RMS stays in FP32, downstream consumers (MatMul) are NOT affected.
+TEST(TransformationTests, DisableFP16CompForRMSNormBlock_KeepsRMSInFP32) {
+    // Build a simple model: Parameter -> RMS -> MatMul -> Result
+    // This RMS does NOT match the Gemma3 Add->RMS->Add->RMS pattern.
+    auto input = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::PartialShape{1, 39, 768});
+    auto gamma = ov::op::v0::Constant::create(ov::element::f32, ov::Shape{768}, {1.0f});
+    auto rms = std::make_shared<ov::op::internal::RMS>(input, gamma, 1e-6);
+    rms->set_friendly_name("rms_target");
+
+    auto weight = ov::op::v0::Constant::create(ov::element::f32, ov::Shape{768, 768}, {0.01f});
+    auto matmul = std::make_shared<ov::op::v0::MatMul>(rms, weight, false, true);
+    matmul->set_friendly_name("matmul_consumer");
+
+    auto model = std::make_shared<ov::Model>(ov::OutputVector{matmul}, ov::ParameterVector{input});
+
+    // Run the pass pipeline: mark RMS -> then ConvertPrecision f32->f16
+    ov::pass::Manager manager;
+    manager.register_pass<DisableFP16CompForRMSNormBlock>();
+
+    precisions_map fp_convert_precision_map = {{ov::element::f32, ov::element::f16}};
+    manager.register_pass<ov::pass::ConvertPrecision>(fp_convert_precision_map);
+    manager.run_passes(model);
+
+    // Verify: RMS should be marked (stays FP32), MatMul should NOT be marked (converts to FP16)
+    for (const auto& op : model->get_ops()) {
+        if (op->get_friendly_name() == "rms_target") {
+            ASSERT_TRUE(ov::is_conversion_disabled(op, ov::element::f16))
+                << "RMS node must have FP16 conversion disabled to prevent NaN from overflow";
+        }
+        if (op->get_friendly_name() == "matmul_consumer") {
+            ASSERT_FALSE(ov::is_conversion_disabled(op, ov::element::f16))
+                << "MatMul consumer should NOT be marked - only RMS needs FP32 protection";
+        }
+    }
 }
