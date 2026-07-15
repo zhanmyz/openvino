@@ -173,6 +173,27 @@ KERNEL(matrix_nms_ref_stage_0)
     const int batchId = get_global_id(0);
     const int classId = get_global_id(1);
 
+    // Zero-initialize this (batch, class) region of the box_info buffer.
+    // The buffer is an uninitialized internal allocation; stage_0 only writes the
+    // surviving detections and leaves the remaining slots untouched, while stage_1
+    // sorts the whole per-batch region by score (descending). If unwritten slots
+    // keep garbage bytes, they can reinterpret as large scores, bubble above the
+    // real detections, and get emitted by stage_2 as out-of-bounds box indices
+    // (producing ~1e9 coordinates / indices). Forcing score == 0 here guarantees
+    // unused slots always sort below every real detection (score > POST_THRESHOLD),
+    // so they can never be emitted. This runs before the background-class early
+    // return below so that the background region is cleared as well.
+    {
+        __global BOX_INFO* box_info_init = (__global BOX_INFO*)buffer0;
+        box_info_init += batchId * NUM_CLASSES * MAX_BOXES_PER_CLASS + classId * MAX_BOXES_PER_CLASS;
+        for (int i = 0; i < MAX_BOXES_PER_CLASS; ++i) {
+            box_info_init[i].batch_idx = 0;
+            box_info_init[i].class_idx = 0;
+            box_info_init[i].box_idx = 0;
+            box_info_init[i].score = INPUT1_VAL_ZERO;
+        }
+    }
+
     if (classId == BACKGROUND_CLASS)
         return;
 
