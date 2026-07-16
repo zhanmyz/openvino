@@ -46,6 +46,11 @@ struct matrix_nms_test_inputs {
     ov::op::v8::MatrixNms::SortResultType sort_result_type;
     ov::op::v8::MatrixNms::DecayFunction decay_function;
     std::string test_name;
+    // Optional priming inference (same input shapes) run before the main one. Used to verify that
+    // stale detections do not leak through the internal box_info buffer, which is zero-initialized
+    // only at allocation and not reset between inferences. Empty means no priming inference.
+    std::vector<float> prime_boxes_values;
+    std::vector<float> prime_scores_values;
 };
 
 using matrix_nms_test_params = std::tuple<matrix_nms_test_inputs, format::type, bool>;
@@ -106,6 +111,27 @@ public:
         topology.add(reorder("matrix_nms", input_info("reordered_matrix_nms"), plain_format, data_type));
 
         cldnn::network::ptr network = get_network(engine, topology, get_test_default_config(engine), get_test_stream_ptr(), is_caching_test);
+
+        // Optional priming inference (same input shapes) to verify that stale detections do not
+        // leak through the internal box_info buffer, which is zero-initialized only at allocation
+        // and not reset between inferences (see get_matrix_nms_stale_buffer_inputs). The caching
+        // path serializes/deserializes the network and does not preserve buffer reuse across the
+        // two inferences, so skip priming there.
+        if (!test_inputs.prime_scores_values.empty() && !is_caching_test) {
+            set_values(boxes, convert<T>(test_inputs.prime_boxes_values));
+            set_values(scores, convert<T>(test_inputs.prime_scores_values));
+            network->set_input_data("boxes", boxes);
+            network->set_input_data("scores", scores);
+            network->execute();
+
+            // valid_outputs accumulates (+=) inside the kernel; clear it so the second inference
+            // starts fresh and only the box_info staleness is under test.
+            cldnn::mem_lock<int, mem_lock_type::write> valid_outputs_reset(valid_outputs, get_test_stream());
+            std::fill(valid_outputs_reset.begin(), valid_outputs_reset.end(), 0);
+
+            set_values(boxes, convert<T>(test_inputs.boxes_values));
+            set_values(scores, convert<T>(test_inputs.scores_values));
+        }
 
         network->set_input_data("boxes", boxes);
         network->set_input_data("scores", scores);
@@ -674,6 +700,37 @@ matrix_nms_test_inputs get_matrix_nms_large_value_of_max_boxes_per_class() {
             "large_value_of_max_boxes_per_class"};
 }
 
+// Regression for CVS-186753: the internal box_info buffer is zero-initialized only at allocation
+// (realloc_intermediates uses reset=false), not between inferences. The priming inference fills
+// both box_info slots with high scores; the main (sparse) inference writes only one slot, so the
+// other must NOT retain the priming detection. Before the fix the stale slot (score 0.9) sorted
+// above the real detection (score 0.6) and was emitted instead of it.
+matrix_nms_test_inputs get_matrix_nms_stale_buffer_inputs() {
+    return {1,       // num_butches
+            2,       // num_boxes
+            1,       // num_classes
+            2,       // num_selected_boxes
+            false,   // sort_result_across_bch
+            0.5f,    // score_threshold
+            -1,      // nms_top_k
+            -1,      // keep_top_k
+            -1,      // background_class
+            2.0f,    // gaussian_sigma
+            0.0f,    // post_threshold
+            true,    // normalized
+            std::vector<float>{0.0, 0.0, 1.0, 1.0, 0.0, 5.0, 1.0, 6.0},     // boxes (main inference)
+            std::vector<float>{0.6, 0.1},                                   // scores (only box 0 passes)
+            std::vector<float>{0.00, 0.60, 0.00, 0.00, 1.00, 1.00,          // expected_output
+                               PAD,  PAD,  PAD,  PAD,  PAD,  PAD},
+            std::vector<int>{0, PADI},                                      // expected_selected_boxes
+            std::vector<int>{1},                                            // expected_valid_output
+            ov::op::v8::MatrixNms::SortResultType::SCORE,                    // sort_result_type
+            ov::op::v8::MatrixNms::DecayFunction::LINEAR,                    // decay_function
+            "stale_box_info_across_inferences",                             // test_name
+            std::vector<float>{0.0, 50.0, 1.0, 51.0, 0.0, 90.0, 1.0, 91.0},  // prime_boxes (1st inference)
+            std::vector<float>{0.9, 0.9}};                                  // prime_scores (fill box_info)
+}
+
 const std::vector<format::type> layout_formats = {format::bfyx,
                                                   format::b_fs_yx_fsv16,
                                                   format::b_fs_yx_fsv32,
@@ -712,6 +769,7 @@ INSTANTIATE_MATRIX_NMS_TEST_SUITE(float, get_matrix_nms_top_k_inputs)
 INSTANTIATE_MATRIX_NMS_TEST_SUITE(float, get_matrix_nms_single_box_inputs)
 INSTANTIATE_MATRIX_NMS_TEST_SUITE(float, get_matrix_nms_no_output_inputs)
 INSTANTIATE_MATRIX_NMS_TEST_SUITE(float, get_matrix_nms_large_value_of_max_boxes_per_class)
+INSTANTIATE_MATRIX_NMS_TEST_SUITE(float, get_matrix_nms_stale_buffer_inputs)
 
 using ov::float16;
 INSTANTIATE_MATRIX_NMS_TEST_SUITE(float16, get_matrix_nms_smoke_inputs)
@@ -728,6 +786,7 @@ INSTANTIATE_MATRIX_NMS_TEST_SUITE(float16, get_matrix_nms_top_k_inputs)
 INSTANTIATE_MATRIX_NMS_TEST_SUITE(float16, get_matrix_nms_single_box_inputs)
 INSTANTIATE_MATRIX_NMS_TEST_SUITE(float16, get_matrix_nms_no_output_inputs)
 INSTANTIATE_MATRIX_NMS_TEST_SUITE(float16, get_matrix_nms_large_value_of_max_boxes_per_class)
+INSTANTIATE_MATRIX_NMS_TEST_SUITE(float16, get_matrix_nms_stale_buffer_inputs)
 
 #ifndef RUN_ALL_MODEL_CACHING_TESTS
 INSTANTIATE_TEST_SUITE_P(matrix_nms_test_float16get_matrix_nms_smoke_inputs_cached,
