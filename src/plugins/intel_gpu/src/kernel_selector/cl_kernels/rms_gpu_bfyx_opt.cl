@@ -23,6 +23,17 @@
 #define OUTPUT_VEC_TYPE MAKE_VECTOR_TYPE(OUTPUT_TYPE, SUBGROUP_BLOCK_SIZE)
 #endif
 
+// When input is f16, values exceeding 65504 overflow to INF. Clamping INF back
+// to +/-HALF_MAX prevents NaN in RMS normalization (INF * rsqrt(INF) = INF*0 = NaN).
+// This gives a finite approximate result with zero performance overhead.
+#if INPUT0_TYPE_SIZE == 2
+#define RMS_CLAMP_ACC(val) clamp((val), (ACCUMULATOR_TYPE)(-65504.0f), (ACCUMULATOR_TYPE)(65504.0f))
+#define RMS_CLAMP_VEC(val) clamp((val), (ACC_TYPE)(-65504.0f), (ACC_TYPE)(65504.0f))
+#else
+#define RMS_CLAMP_ACC(val) (val)
+#define RMS_CLAMP_VEC(val) (val)
+#endif
+
 REQD_SUB_GROUP_SIZE(SUB_GROUP_SIZE)
 KERNEL(rms_gpu_bfyx_opt)(
     OPTIONAL_SHAPE_INFO_ARG
@@ -80,7 +91,7 @@ KERNEL(rms_gpu_bfyx_opt)(
     {
         for (; i < items_num - (items_num % SUBGROUP_BLOCK_SIZE); i += SUBGROUP_BLOCK_SIZE)
         {
-            ACC_TYPE vec_tmp = TO_ACC_TYPE(BLOCK_READ(input, input_data_offset + subgroup_offset + i * get_sub_group_size()));
+            ACC_TYPE vec_tmp = RMS_CLAMP_VEC(TO_ACC_TYPE(BLOCK_READ(input, input_data_offset + subgroup_offset + i * get_sub_group_size())));
 #if SUBGROUP_BLOCK_SIZE == 1
             rms += native_powr(vec_tmp, 2);
             data[i] = vec_tmp;
@@ -97,14 +108,14 @@ KERNEL(rms_gpu_bfyx_opt)(
 
     for (; i < items_num; i++)
     {
-        ACCUMULATOR_TYPE tmp = TO_ACCUMULATOR_TYPE(input[input_data_offset + subgroup_offset + get_sub_group_local_id() + i * get_sub_group_size()]);
+        ACCUMULATOR_TYPE tmp = RMS_CLAMP_ACC(TO_ACCUMULATOR_TYPE(input[input_data_offset + subgroup_offset + get_sub_group_local_id() + i * get_sub_group_size()]));
         rms += native_powr(tmp, 2);
         data[i] = tmp;
     }
 
     if (in_data_idx < leftovers)
     {
-        ACCUMULATOR_TYPE tmp = TO_ACCUMULATOR_TYPE(input[input_data_offset + workers_per_data * items_num + in_data_idx]);
+        ACCUMULATOR_TYPE tmp = RMS_CLAMP_ACC(TO_ACCUMULATOR_TYPE(input[input_data_offset + workers_per_data * items_num + in_data_idx]));
         rms += native_powr(tmp, 2);
         data[items_num] = tmp;
     }

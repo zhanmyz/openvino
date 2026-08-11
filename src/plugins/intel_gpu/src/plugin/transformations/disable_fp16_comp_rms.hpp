@@ -40,4 +40,31 @@ public:
     DisableFP16CompForGemma3RMSPattern();
 };
 
+/**
+ * @brief Disables fp16 compression for RMS nodes whose upstream MatMul weights
+ * can produce outputs exceeding the fp16 representable range.
+ *
+ * Overflow criterion (Cauchy-Schwarz inequality on dot product):
+ *   After RMS normalization, ||X||_2 = sqrt(K) (unit-RMS, K = feature dim).
+ *   For weight row W_j: ||W_j||_2 ≤ sqrt(K) × max|W|.
+ *   By Cauchy-Schwarz: |Y_j| = |X · W_j| ≤ ||X||_2 × ||W_j||_2 ≤ K × max|W|.
+ *   Overflow occurs when: K × max|W| > FP16_MAX (65504).
+ *   Equivalently: max|W| > FP16_MAX / K.
+ *
+ * Models trained in pure FP32 (e.g. T5/ParlerTTS) can have large weight values
+ * (max|W| > FP16_MAX / K), producing MatMul outputs that overflow fp16.
+ * INF propagates through residual Add into RMS: rsqrt(INF)=0, INF×0=NaN.
+ *
+ * Models trained with FP16/BF16 awareness (e.g. gemma-3, qwen3) keep weights
+ * bounded (max|W| << FP16_MAX / K), making overflow impossible.
+ *
+ * Detection: traces from RMS → Add (residual) → MatMul → weight Constant.
+ * Evaluates the derived overflow criterion against the actual weight values.
+ */
+class DisableFP16CompForRMSWithFullPrecisionWeights : public ov::pass::MatcherPass {
+public:
+    OPENVINO_MATCHER_PASS_RTTI("DisableFP16CompForRMSWithFullPrecisionWeights");
+    DisableFP16CompForRMSWithFullPrecisionWeights();
+};
+
 }   // namespace ov::intel_gpu

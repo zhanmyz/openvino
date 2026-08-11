@@ -4,6 +4,14 @@
 
 #include "include/fetch_utils.cl"
 
+// When input is f16, values exceeding 65504 overflow to INF. Clamping INF back
+// to +/-HALF_MAX prevents NaN in RMS normalization (INF * rsqrt(INF) = INF*0 = NaN).
+#if INPUT0_TYPE_SIZE == 2
+#define RMS_CLAMP(val) clamp((val), (ACCUMULATOR_TYPE)(-65504.0f), (ACCUMULATOR_TYPE)(65504.0f))
+#else
+#define RMS_CLAMP(val) (val)
+#endif
+
 KERNEL(rms_gpu_ref)(
     OPTIONAL_SHAPE_INFO_ARG
     const __global INPUT0_TYPE* input,
@@ -25,7 +33,8 @@ KERNEL(rms_gpu_ref)(
         for (uint y = 0; y < INPUT0_SIZE_Y; y++) {
             for (uint x = 0; x < INPUT0_SIZE_X; x++) {
                 const uint input_idx = FUNC_CALL(get_input_index)(OPTIONAL_SHAPE_INFO_TENSOR b, f, w, z, y, x);
-                rms += pow(TO_ACCUMULATOR_TYPE(input[input_idx]), 2);
+                ACCUMULATOR_TYPE val = RMS_CLAMP(TO_ACCUMULATOR_TYPE(input[input_idx]));
+                rms += pow(val, 2);
             }
         }
     }
@@ -38,15 +47,16 @@ KERNEL(rms_gpu_ref)(
             for (uint x = 0; x < INPUT0_SIZE_X; x++) {
                 const uint input_idx = FUNC_CALL(get_input_index)(OPTIONAL_SHAPE_INFO_TENSOR b, f, w, z, y, x);
                 const uint output_idx = FUNC_CALL(get_output_index)(OPTIONAL_SHAPE_INFO_TENSOR b, f, w, z, y, x);
+                ACCUMULATOR_TYPE input_val = RMS_CLAMP(TO_ACCUMULATOR_TYPE(input[input_idx]));
 #if ELEMENTWISE_AFFINE
 #if INPUT0_DIMS == 4
                 const uint gamma_idx = y;
 #elif INPUT0_DIMS == 5
                 const uint gamma_idx = z;
 #endif
-                OUTPUT_TYPE result = TO_OUTPUT_TYPE(rms) * TO_OUTPUT_TYPE(input[input_idx]) * TO_OUTPUT_TYPE(gamma[gamma_idx]);
+                OUTPUT_TYPE result = TO_OUTPUT_TYPE(rms) * TO_OUTPUT_TYPE(input_val) * TO_OUTPUT_TYPE(gamma[gamma_idx]);
 #else
-                OUTPUT_TYPE result = TO_OUTPUT_TYPE(rms) * TO_OUTPUT_TYPE(input[input_idx]);
+                OUTPUT_TYPE result = TO_OUTPUT_TYPE(rms) * TO_OUTPUT_TYPE(input_val);
 #endif
                 #if HAS_FUSED_OPS
                     FUSED_OPS;
