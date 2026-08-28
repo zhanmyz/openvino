@@ -27,10 +27,12 @@
 #include "border_inst.h"
 #include "lora_inst.h"
 #include "mvn_inst.h"
+#include "scaled_dot_product_attention_inst.h"
 
 #include "pass_manager.h"
 #include "program_helpers.h"
 
+#include <algorithm>
 #include <utility>
 #include <list>
 #include <vector>
@@ -409,6 +411,21 @@ static bool is_optimizable_padding_for_crop(const crop_node& node,
     return true;
 }
 
+// General kernel-capability check, independent of any specific model: true if `node`'s
+// GPU kernel implementations require their input to be a physically contiguous buffer
+// and cannot honor a non-zero pad_before/pitch coming from an upstream in-place crop.
+// Kernels that are safe to receive such a padded/strided view (rope via shape_info,
+// vl_sdpa via its CM token_offset_* scalars, eltwise/reorder/mvn-excluded elsewhere via
+// standard pitch-aware addressing, ...) are NOT flagged here. Currently the only known
+// GPU primitive with this limitation is the generic (non-fused) scaled_dot_product_attention:
+// none of its 4 kernel selector implementations (sdpa_ref/opt/gen_opt/gen_micro) read
+// padding or offset metadata; they all index Q/K/V assuming a contiguous buffer. Any
+// model whose graph feeds this crop+reshape pattern into that primitive hits the same
+// corruption; Qwen-VL is simply the reported instance, not the scope of this check.
+static bool requires_contiguous_input(const program_node& node) {
+    return node.is_type<scaled_dot_product_attention>();
+}
+
 bool crop_in_place_optimization::can_crop_be_optimized_along_feature(const layout& crop_layout,
                                                                      const layout& input_layout) {
     auto format = crop_layout.format;
@@ -729,6 +746,15 @@ bool crop_in_place_optimization::update_in_place_crop_padding_along_feature(cons
             // scaling cannot be represented on the L (batch) axis.
             const bool is_axis1_size1_squeeze = reshape_mode == reshape::reshape_mode::base && crop_axis == 1 && crop_dim_val == 1 &&
                                                 reshape_ps.size() + 1 == crop_ps.size() && reshape_ps.size() >= 2 && reshape_ps[1].is_static();
+
+            // CVS-192936: do not place a scaled, non-trivial padding view (see below) in
+            // front of any consumer that requires contiguous input, no matter how many
+            // other consumers the reshape has or which model produced the graph.
+            const auto& reshape_users = user_info.first->get_users();
+            const bool feeds_unsafe_consumer = std::any_of(reshape_users.begin(), reshape_users.end(),
+                [](const program_node* user) { return requires_contiguous_input(*user); });
+            if (is_axis1_size1_squeeze && feeds_unsafe_consumer)
+                return false;
 
             if (is_axis1_size1_squeeze) {
                 const auto h_size = reshape_ps[1].get_length();
