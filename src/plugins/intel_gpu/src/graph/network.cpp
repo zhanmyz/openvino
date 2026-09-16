@@ -5,10 +5,14 @@
 #include "intel_gpu/graph/network.hpp"
 
 #include <algorithm>
+#include <cstdlib>
+#include <exception>
 #include <fstream>
 #include <functional>
+#include <iostream>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <stack>
 #include <string>
@@ -277,8 +281,19 @@ network::~network() {
     }
 
     // Clear the command queue to prevent errors caused by remaining tasks.
+    // A destructor is implicitly noexcept, and finish() reports OpenCL failures (e.g. CL_OUT_OF_RESOURCES
+    // left over from an earlier error) by throwing, which would terminate the process during unwinding
+    // and discard the original error.
     if (_stream != nullptr) {
-        _stream->finish();
+        try {
+            _stream->finish();
+        } catch (const std::exception& e) {
+            std::cerr << "[CVS-192746][NETWORK-DTOR-THROW] ~network(" << net_id << "): stream finish() failed: "
+                      << e.what() << std::endl;
+        } catch (...) {
+            std::cerr << "[CVS-192746][NETWORK-DTOR-THROW] ~network(" << net_id
+                      << "): stream finish() failed with an unknown exception" << std::endl;
+        }
     }
 
     _memory_pool->clear_pool_for_network(net_id);
@@ -975,7 +990,41 @@ void network::execute_impl(const std::vector<event::ptr>& events) {
         }
 
         inst->prepare_primitive();
-        inst->execute();
+
+        // [CVS-192746 DEBUG PROBE] Optional device-wide serialization of primitive submission across
+        // ALL streams/networks, to test whether the intermittent CL_OUT_OF_RESOURCES seen only under
+        // concurrent multi-stream submission (confirmed absent with -nstreams 1) is eliminated when
+        // concurrent GPU command submission from independent streams is removed. Disabled by default;
+        // enable with OV_GPU_GLOBAL_SERIALIZE_EXEC=1. This is a diagnostic experiment, not a proposed fix
+        // (it would serialize all GPU work across streams and defeat the purpose of multiple streams).
+        static const bool global_serialize = (std::getenv("OV_GPU_GLOBAL_SERIALIZE_EXEC") != nullptr);
+        static std::mutex global_exec_mutex;
+        if (global_serialize) {
+            std::lock_guard<std::mutex> lock(global_exec_mutex);
+            inst->execute();
+        } else {
+            inst->execute();
+        }
+
+        // [CVS-192746 DEBUG PROBE] Optional per-primitive synchronization to pinpoint the exact
+        // primitive whose kernel is the first to actually fault on the GPU. OpenCL kernel enqueues
+        // are asynchronous, so a faulting kernel is normally only detected much later (e.g. in
+        // ~network()'s finish() call), by which point many other primitives have already been
+        // enqueued, making the true culprit impossible to identify. Forcing a sync right after each
+        // primitive (opt-in only, drastically slower) attributes any GPU-side error to this exact
+        // primitive instead. Disabled by default; enable with OV_GPU_SYNC_EACH_PRIMITIVE=1.
+        static const bool sync_each_primitive = (std::getenv("OV_GPU_SYNC_EACH_PRIMITIVE") != nullptr);
+        if (sync_each_primitive) {
+            try {
+                get_stream().finish();
+            } catch (const std::exception& e) {
+                std::cerr << "[CVS-192746][SYNC-EACH-PRIMITIVE-FAULT] first faulting primitive id=" << inst->id()
+                          << " type=" << inst->desc()->type_string()
+                          << " net_id=" << net_id
+                          << ": " << e.what() << std::endl;
+                throw;
+            }
+        }
 
         executed_prims++;
         if (needs_flushing && executed_prims % flush_frequency == 0) {

@@ -11,6 +11,8 @@
 #include "compounds.hpp"
 
 #include <type_traits>
+#include <exception>
+#include <iostream>
 
 #ifdef ENABLE_ONEDNN_FOR_GPU
 #include <oneapi/dnnl/dnnl.hpp>
@@ -183,9 +185,17 @@ struct mem_lock {
     explicit mem_lock(memory::ptr mem, const stream& stream) : _mem(std::move(mem)), _stream(stream),
                       _ptr(reinterpret_cast<T*>(_mem->lock(_stream, lock_type))) {}
 
+    // A destructor is implicitly noexcept: letting unlock() throw here terminates the process and
+    // destroys the original exception, so failures are reported instead of propagated.
     ~mem_lock() {
         _ptr = nullptr;
-        _mem->unlock(_stream);
+        try {
+            _mem->unlock(_stream);
+        } catch (const std::exception& e) {
+            std::cerr << "[CVS-192746][MEM-UNLOCK-THROW] ~mem_lock: unlock() threw: " << e.what() << std::endl;
+        } catch (...) {
+            std::cerr << "[CVS-192746][MEM-UNLOCK-THROW] ~mem_lock: unlock() threw an unknown exception" << std::endl;
+        }
     }
 
     size_t size() const { return _mem->size() / sizeof(T); }

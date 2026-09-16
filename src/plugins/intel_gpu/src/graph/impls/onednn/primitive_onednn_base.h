@@ -20,6 +20,11 @@
 #include <vector>
 #include <utility>
 #include <mutex>
+#include <atomic>        // [CVS-192746 DEBUG]
+#include <thread>        // [CVS-192746 DEBUG]
+#include <iostream>      // [CVS-192746 DEBUG]
+#include <unordered_map> // [CVS-192746 DEBUG]
+#include <cstdlib>       // [CVS-192746 DEBUG]
 
 #include <oneapi/dnnl/dnnl.hpp>
 
@@ -28,6 +33,18 @@ namespace onednn {
 
 static std::mutex cacheAccessMutex;
 
+// ===================== [CVS-192746 DEBUG PROBE] =====================
+// Shared bookkeeping to detect concurrent execution of the SAME underlying
+// oneDNN primitive handle by multiple stream threads. Keyed by dnnl_primitive_t.
+static std::mutex dbg_race_mtx;
+static std::unordered_map<const void*, int> dbg_race_inflight;
+// Global enqueue sequence number + "first failure only" latch, so the very first
+// GPU error (root cause) can be dumped in full detail instead of being buried under
+// the cascade of failures that follow once the device enters an error state.
+static std::atomic<uint64_t> dbg_enqueue_seq{0};
+static std::atomic<bool> dbg_first_failure_reported{false};
+// ===================================================================
+
 template <class PType, class PrimDescType = dnnl::primitive_desc, class PrimType = dnnl::primitive>
 struct typed_primitive_onednn_impl : public typed_primitive_impl<PType> {
     const engine* _engine;
@@ -35,6 +52,14 @@ struct typed_primitive_onednn_impl : public typed_primitive_impl<PType> {
     PrimDescType _pd;
     PrimType _prim;
     std::unordered_map<uint32_t, std::unordered_map<int, dnnl::memory>> _args;
+    // [CVS-192746] Per-shared-primitive execution lock.
+    // dnnl::primitive is a ref-counted handle: clone() copies the handle, so all per-stream
+    // impl copies share ONE underlying dnnl_primitive_t (and its internal cl_kernel objects).
+    // Concurrent _prim.execute() from multiple stream threads races inside oneDNN's OpenCL
+    // enqueue (clSetKernelArg on a shared cl_kernel) and corrupts memory. This mutex is a
+    // shared_ptr so that clone() shares it together with _prim: same primitive -> same lock,
+    // different primitives -> different locks (cross-layer stream parallelism is preserved).
+    std::shared_ptr<std::mutex> _exec_mutex = std::make_shared<std::mutex>();
     dnnl::memory::desc _scratchpad_md;
     bool _enable_profiling = false;
 
@@ -541,9 +566,6 @@ protected:
 
     event::ptr execute_impl(const std::vector<event::ptr>& /* events */,
                             typed_primitive_inst<PType>& instance) override {
-#ifdef OV_GPU_WITH_ZE_RT
-        static std::mutex execute_mutex;
-#endif
         auto& network = instance.get_network();
         auto& stream = network.get_stream();
         auto net_id = network.get_id();
@@ -558,16 +580,89 @@ protected:
         }
 
         if (!instance.can_be_optimized()) {
-            try {
-#ifdef OV_GPU_WITH_ZE_RT
-                // Prevent race condition issue for Level Zero runtime
-                // To be removed once MFDNN-15356 is resolved
-                std::lock_guard<std::mutex> lock(execute_mutex);
-#endif
-                _prim.execute(stream.get_onednn_stream(), _args[net_id]);
-            } catch (dnnl::error& err) {
-                OPENVINO_THROW(err.what());
+            const void* dbg_prim_handle = static_cast<const void*>(_prim.get(true));
+
+            // ============================ [CVS-192746 FIX] ============================
+            // Serialize concurrent execution of the SAME shared dnnl primitive across
+            // streams. _exec_mutex is shared (via clone) with _prim, so different
+            // primitives keep independent locks and still run in parallel across streams.
+            // Escape hatch (debug only): OV_GPU_ONEDNN_NO_SERIALIZE=1 disables the fix to
+            // reproduce the original race/crash on the same binary.
+            static const bool fix_disabled = (std::getenv("OV_GPU_ONEDNN_NO_SERIALIZE") != nullptr);
+            std::unique_lock<std::mutex> exec_lock(*_exec_mutex, std::defer_lock);
+            if (!fix_disabled)
+                exec_lock.lock();
+
+            // ------------------------- [CVS-192746 DEBUG PROBE] -----------------------
+            // Detect concurrent execution of the same primitive handle. With the fix
+            // enabled this stays at inflight=1 (serialized); with the fix disabled it
+            // reports inflight>1 (the data race). The tiny bookkeeping lock guards only
+            // the counter, not the GPU enqueue.
+            int dbg_depth = 0;
+            {
+                std::lock_guard<std::mutex> dbg_lk(dbg_race_mtx);
+                dbg_depth = ++dbg_race_inflight[dbg_prim_handle];
             }
+            if (dbg_depth > 1) {
+                std::cerr << "[CVS-192746][ONEDNN-RACE] same dnnl primitive executed concurrently"
+                          << " prim=" << dbg_prim_handle
+                          << " impl=" << static_cast<const void*>(this)
+                          << " id=" << instance.id()
+                          << " net_id=" << net_id
+                          << " tid=" << std::this_thread::get_id()
+                          << " inflight=" << dbg_depth << std::endl;
+            }
+            // --------------------------------------------------------------------------
+
+            try {
+                // [CVS-192746] Tag this enqueue with a global sequence number so that, if it fails,
+                // we can tell whether it was the very FIRST GPU error (the root cause) or one of the
+                // cascade of failures that follow once the device/driver enters an error state.
+                const uint64_t seq = dbg_enqueue_seq.fetch_add(1);
+                _prim.execute(stream.get_onednn_stream(), _args[net_id]);
+                (void)seq;
+            } catch (dnnl::error& err) {
+                bool is_first = false;
+                {
+                    bool expected = false;
+                    is_first = dbg_first_failure_reported.compare_exchange_strong(expected, true);
+                }
+                if (is_first) {
+                    // [CVS-192746] Full dump of the FIRST failure only: exact layer id/shape/dtype/format,
+                    // since everything reported after this is very likely a downstream cascade once the
+                    // GPU/driver enters an error state (see the CL_OUT_OF_RESOURCES warning message).
+                    const auto& in_l = instance.get_input_layout(0);
+                    const auto& out_l = instance.get_output_layout();
+                    std::cerr << "[CVS-192746][ONEDNN-FIRST-FAILURE] id=" << instance.id()
+                              << " net_id=" << net_id
+                              << " tid=" << std::this_thread::get_id()
+                              << " status=" << static_cast<int>(err.status)
+                              << " what=" << err.what()
+                              << " input0=" << in_l.to_short_string()
+                              << " output=" << out_l.to_short_string()
+                              << std::endl;
+                } else {
+                    // [CVS-192746] Identify the failing layer: the bare dnnl message has no primitive id.
+                    std::cerr << "[CVS-192746][ONEDNN-EXEC-FAIL] id=" << instance.id()
+                              << " net_id=" << net_id
+                              << " tid=" << std::this_thread::get_id()
+                              << " status=" << static_cast<int>(err.status)
+                              << " what=" << err.what() << std::endl;
+                }
+                OPENVINO_THROW("[GPU] oneDNN execute failed for primitive '", instance.id(), "' (net_id=", net_id, "): ", err.what());
+            }
+
+            // [CVS-192746 DEBUG PROBE] release the in-flight counter for this handle
+            {
+                std::lock_guard<std::mutex> dbg_lk(dbg_race_mtx);
+                --dbg_race_inflight[dbg_prim_handle];
+            }
+
+            // [CVS-192746 FIX] Release the per-primitive lock right after the (async) enqueue.
+            // The oneDNN enqueue is the only operation that touches the shared primitive; the
+            // profiling wait/event handling below is per-stream and needs no serialization.
+            if (exec_lock.owns_lock())
+                exec_lock.unlock();
 
             if (_enable_profiling) {
                 // Call wait() function here instead of finish() to prevent cache flushing,

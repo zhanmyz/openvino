@@ -181,24 +181,33 @@ std::map<std::string, ov::Tensor> get_remote_output_tensors(const ov::CompiledMo
 #ifdef HAVE_GPU_DEVICE_MEM_SUPPORT
     std::map<std::string, ov::Tensor> outputTensors;
     std::shared_ptr<const ov::Model> runtime_model = nullptr;
+    // Created lazily: the OpenCL wrapper builds a new cl_command_queue, and this helper runs once per
+    // iteration in the measurement loop, where the buffer is normally reused and no context is needed.
+    std::shared_ptr<OpenCL> oclInstance = nullptr;
     for (auto& output : compiledModel.outputs()) {
         auto context = compiledModel.get_context();
         auto& oclContext = static_cast<ov::intel_gpu::ocl::ClContext&>(context);
-        auto oclInstance = std::make_shared<OpenCL>(oclContext.get());
         ov::Shape shape = get_static_shape(output);
         cl_int err;
         auto elementsNum = shape_size(shape);
         auto inputSize = elementsNum * output.get_element_type().bitwidth() / 8;
 
+        auto get_ocl_instance = [&]() {
+            if (!oclInstance) {
+                oclInstance = std::make_shared<OpenCL>(oclContext.get());
+            }
+            return oclInstance;
+        };
+
         cl::size_type bufferSize = 0;
         if (clBuffer.find(output.get_any_name()) == clBuffer.end()) {
             clBuffer[output.get_any_name()] =
-                cl::Buffer(oclInstance->_context, CL_MEM_READ_WRITE, (cl::size_type)inputSize, NULL, &err);
+                cl::Buffer(get_ocl_instance()->_context, CL_MEM_READ_WRITE, (cl::size_type)inputSize, NULL, &err);
         } else {
             auto& buff = clBuffer[output.get_any_name()];
             buff.getInfo(CL_MEM_SIZE, &bufferSize);
             if (inputSize != bufferSize) {
-                buff = cl::Buffer(oclInstance->_context, CL_MEM_READ_WRITE, (cl::size_type)inputSize, NULL, &err);
+                buff = cl::Buffer(get_ocl_instance()->_context, CL_MEM_READ_WRITE, (cl::size_type)inputSize, NULL, &err);
             }
         }
         outputTensors[output.get_any_name()] =
