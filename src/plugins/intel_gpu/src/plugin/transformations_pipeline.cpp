@@ -693,6 +693,17 @@ void TransformationsPipeline::apply(std::shared_ptr<ov::Model> func) {
             return false;
         }();
 
+        // AltUp has RMS inputs outside the existing double-Add pattern; restrict this protection to its FP16 graphs.
+        const bool is_gemma3n = infer_precision == ov::element::f16 && [&func]() {
+            for (const auto& op : func->get_ops()) {
+                const auto& name = op->get_friendly_name();
+                if (name.find("altup_projections.") != std::string::npos) {
+                    return true;
+                }
+            }
+            return false;
+        }();
+
         // MOE: TiledMoeBlock -> GatherMatmuls(compressed) -> MoeOp(compressed) -> MoeOpWithRouting(compressed).
         // Gated on supports_immad (systolic-only) and oneDNN (required for expert GEMM dispatch).
         // Note: even though we are already inside `if (supports_immad)`, oneDNN can still be explicitly disabled by the user.
@@ -803,6 +814,14 @@ void TransformationsPipeline::apply(std::shared_ptr<ov::Model> func) {
         manager.register_pass<ov::pass::RMSFusion>(false, true);
         manager.register_pass<DisableFP16CompForGemma3RMSPattern>();
         manager.register_pass<DisableFP16CompForDecomposedRMSPattern>();
+        // CVS-194292: debug-only ablation switch to reproduce the pre-fix (AltUp FP16
+        // overflow) behavior for A/B comparison without a separate branch/checkout.
+        if (is_gemma3n && std::getenv("OV_GPU_CVS194292_DISABLE_FIX") == nullptr) {
+            // Keep the normalization input and its immediate producer in f32.
+            pass_config->set_callback<DisableFP16CompForRMSResidualPattern>(
+                [](const_node_ptr& node) -> bool { return ov::is_conversion_disabled(node, ov::element::f16); });
+            manager.register_pass<DisableFP16CompForRMSResidualPattern>();
+        }
         const bool fp16_activation_scaling_enabled =
             config.get_activations_scale_factor() > 0.f && infer_precision == ov::element::f16;
         // Gated residuals need FP32 protection only when FP16 activation scaling is enabled.
