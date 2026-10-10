@@ -693,6 +693,28 @@ void TransformationsPipeline::apply(std::shared_ptr<ov::Model> func) {
             return false;
         }();
 
+        // AltUp (Gemma3n) feeds RMS norms from Gather/MatMul/Add/Divide/Reshape producers
+        // rather than the plain residual-Add pattern the other RMS passes cover, and has no
+        // dedicated opset type to key off (unlike is_pa above), so match on two independent
+        // AltUp/Laurel-specific PyTorch module-path markers instead of a single one.
+        const bool is_gemma3n = infer_precision == ov::element::f16 && [&func]() {
+            bool has_altup_projections = false;
+            bool has_laurel = false;
+            for (const auto& op : func->get_ops()) {
+                const auto& name = op->get_friendly_name();
+                if (!has_altup_projections && name.find("altup_projections.") != std::string::npos) {
+                    has_altup_projections = true;
+                }
+                if (!has_laurel && name.find(".laurel") != std::string::npos) {
+                    has_laurel = true;
+                }
+                if (has_altup_projections && has_laurel) {
+                    return true;
+                }
+            }
+            return false;
+        }();
+
         // MOE: TiledMoeBlock -> GatherMatmuls(compressed) -> MoeOp(compressed) -> MoeOpWithRouting(compressed).
         // Gated on supports_immad (systolic-only) and oneDNN (required for expert GEMM dispatch).
         // Note: even though we are already inside `if (supports_immad)`, oneDNN can still be explicitly disabled by the user.
@@ -803,6 +825,12 @@ void TransformationsPipeline::apply(std::shared_ptr<ov::Model> func) {
         manager.register_pass<ov::pass::RMSFusion>(false, true);
         manager.register_pass<DisableFP16CompForGemma3RMSPattern>();
         manager.register_pass<DisableFP16CompForDecomposedRMSPattern>();
+        if (is_gemma3n) {
+            // Keep the normalization input and its immediate producer in f32.
+            pass_config->set_callback<DisableFP16CompForRMSResidualPattern>(
+                [](const_node_ptr& node) -> bool { return ov::is_conversion_disabled(node, ov::element::f16); });
+            manager.register_pass<DisableFP16CompForRMSResidualPattern>();
+        }
         const bool fp16_activation_scaling_enabled =
             config.get_activations_scale_factor() > 0.f && infer_precision == ov::element::f16;
         // Gated residuals need FP32 protection only when FP16 activation scaling is enabled.

@@ -89,4 +89,39 @@ DisableFP16CompForDecomposedRMSPattern::DisableFP16CompForDecomposedRMSPattern()
     register_matcher(m, callback);
 }
 
+DisableFP16CompForRMSResidualPattern::DisableFP16CompForRMSResidualPattern() {
+    using namespace ov::pass::pattern;
+
+    auto const_or_convert = std::make_shared<ov::pass::pattern::op::Or>(OutputVector{
+        wrap_type<ov::op::v0::Constant>(),
+        wrap_type<ov::op::v0::Convert>({wrap_type<ov::op::v0::Constant>()})
+    });
+
+    // AltUp feeds some RMS norms from a Gather over a shared multi-stream hidden state
+    // rather than a plain residual Add, so match on the RMS node's input type only.
+    auto rms_m = wrap_type<ov::op::internal::RMS>({any_input(), const_or_convert}, type_matches(element::f32));
+
+    ov::matcher_pass_callback callback = [OV_CAPTURE_CPY_AND_THIS](ov::pass::pattern::Matcher& m) {
+        const auto& pattern_map = m.get_pattern_value_map();
+        auto rms = ov::as_type_ptr<ov::op::internal::RMS>(pattern_map.at(rms_m).get_node_shared_ptr());
+        if (!rms || transformation_callback(rms)) {
+            return false;
+        }
+
+        // Only protect one hop upstream (the direct producer), never the whole subgraph
+        // above it, to avoid forcing unrelated parts of the network (e.g. FC weights,
+        // MoE routing) into fp32.
+        auto producer = rms->get_input_node_shared_ptr(0);
+        if (producer->get_output_element_type(0) != element::f32) {
+            return false;
+        }
+        ov::disable_conversion(producer, element::f16);
+        ov::disable_conversion(rms, element::f16);
+        return true;
+    };
+
+    auto m = std::make_shared<ov::pass::pattern::Matcher>(rms_m, "DisableFP16CompForRMSResidualPattern");
+    register_matcher(m, callback);
+}
+
 }  // namespace ov::intel_gpu

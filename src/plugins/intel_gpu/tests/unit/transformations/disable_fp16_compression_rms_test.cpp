@@ -21,6 +21,7 @@
 #include "openvino/op/add.hpp"
 #include "openvino/op/convolution.hpp"
 #include "openvino/op/divide.hpp"
+#include "openvino/op/matmul.hpp"
 #include "openvino/op/multiply.hpp"
 #include "openvino/op/power.hpp"
 #include "openvino/op/reduce_mean.hpp"
@@ -223,3 +224,62 @@ INSTANTIATE_TEST_SUITE_P(
     testing::Values(DecomposedRMSConstants{2.1f, 1.0f, "PowerExponentNotTwo"},
                     DecomposedRMSConstants{2.0f, 1.1f, "DivideNumeratorNotOne"}),
     DisableFP16CompForDecomposedRMSNegativeTest::getTestCaseName);
+
+// CVS-194292 (Gemma-3n-E4B): real dGPU E2E tensor dumps (guaranteed-clean model_cache,
+// see dump_ov/cvs-194292/run_clean_e2e.sh) pinned the actual failing node down to
+// layer 4's post_feedforward_layernorm RMS, fed directly by mlp.down_proj's MatMul output
+// (not a residual Add) -- a shape DisableFP16CompForGemma3RMSPattern above does not cover
+// (it requires a (Add, RMS) -> Add -> RMS double-Add residual). This model mirrors that
+// exact real shape: MatMul -> RMS, with no Add anywhere.
+static const std::string name_down_proj_matmul = "mlp.down_proj_matmul";
+static const std::string name_post_feedforward_rms = "post_feedforward_layernorm_rms";
+
+static std::shared_ptr<ov::Model> create_matmul_fed_rms_model() {
+    auto input = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::PartialShape{1, 32, 128});
+    auto weights = ov::op::v0::Constant::create(ov::element::f32, ov::Shape{128, 128}, {1.0f});
+    auto matmul = std::make_shared<ov::op::v0::MatMul>(input, weights, false, true);
+    matmul->set_friendly_name(name_down_proj_matmul);
+
+    auto gamma = ov::op::v0::Constant::create(ov::element::f32, ov::Shape{128}, {1.0f});
+    auto rms = std::make_shared<ov::op::internal::RMS>(matmul, gamma, 1e-5);
+    rms->set_friendly_name(name_post_feedforward_rms);
+
+    return std::make_shared<ov::Model>(ov::OutputVector{rms}, ov::ParameterVector{input});
+}
+
+static void run_rms_residual_test(std::shared_ptr<ov::Model> model,
+                                  const std::unordered_map<std::string, bool>& expected_fp16_disabled_status) {
+    ov::pass::Manager manager;
+    manager.register_pass<DisableFP16CompForRMSResidualPattern>();
+
+    precisions_map fp_convert_precision_map = {
+        {ov::element::f32, ov::element::f16}
+    };
+    manager.register_pass<ov::pass::ConvertPrecision>(fp_convert_precision_map);
+
+    manager.run_passes(model);
+
+    for (const auto& op : model->get_ops()) {
+        auto it = expected_fp16_disabled_status.find(op->get_friendly_name());
+        if (it != expected_fp16_disabled_status.end()) {
+            bool expected_status = it->second;
+            if (expected_status) {
+                ASSERT_TRUE(ov::is_conversion_disabled(op, ov::element::f16))
+                    << "FP16 compression is not disabled for node: " << op->get_friendly_name();
+            } else {
+                ASSERT_FALSE(ov::is_conversion_disabled(op, ov::element::f16))
+                    << "FP16 compression is unexpectedly disabled for node: " << op->get_friendly_name();
+            }
+        }
+    }
+}
+
+TEST(TransformationTests, DisableFP16CompForRMSResidual_MatMulProducer_Positive) {
+    auto model = create_matmul_fed_rms_model();
+    // Both the MatMul producer and the RMS it feeds must keep FP16 compression disabled.
+    std::unordered_map<std::string, bool> expected_status = {
+        {name_down_proj_matmul, true},
+        {name_post_feedforward_rms, true}
+    };
+    run_rms_residual_test(model, expected_status);
+}

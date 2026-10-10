@@ -53,4 +53,11 @@ public:
     DisableFP16CompForDecomposedRMSPattern();
 };
 
+/** @brief Keep fused RMS and its immediate f32 producer out of FP16 for AltUp graphs. */
+class DisableFP16CompForRMSResidualPattern : public ov::pass::MatcherPass {
+public:
+    OPENVINO_MATCHER_PASS_RTTI("DisableFP16CompForRMSResidualPattern");
+    DisableFP16CompForRMSResidualPattern();
+};
+
 }   // namespace ov::intel_gpu
